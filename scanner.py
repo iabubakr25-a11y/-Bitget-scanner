@@ -2,7 +2,7 @@
 Bitget Spot volume-spike scanner
 - Finds small USDT spot coins whose volume jumps suddenly while price stays flat
 - Checks whether the spike looks real or like wash trading
-- Sends results by email
+- Sends results by ntfy (phone push) + email
 """
 import json
 import os
@@ -10,6 +10,7 @@ import smtplib
 import statistics
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
 
 import requests
@@ -184,39 +185,65 @@ def save_state(st):
         json.dump(st, fh)
 
 
-# ---------------- Email ----------------
-def send_email(subject, body):
+# ---------------- Alerts: ntfy (phone push) + Email ----------------
+def send_ntfy(subject, body, urgent=False):
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    try:
+        r = requests.post("https://ntfy.sh/", json={
+            "topic": topic, "title": subject, "message": body[:3900],
+            "priority": 5 if urgent else 3, "tags": ["chart_with_upwards_trend"],
+        }, timeout=10)
+        print("ntfy:", r.status_code)
+    except Exception as e:
+        print("ntfy failed:", e)
+
+
+def send_email(subject, body, urgent=False):
+    send_ntfy(subject, body, urgent)
     user, pw = os.environ.get("EMAIL_USER"), os.environ.get("EMAIL_PASS")
     to = os.environ.get("EMAIL_TO") or user
     if not user or not pw:
         print("No email secrets set — printing instead:\n" + body)
         return
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"], msg["From"], msg["To"] = subject, user, to
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(user, pw)
-        s.sendmail(user, [to], msg.as_string())
-    print("Email sent to", to)
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"], msg["From"], msg["To"] = subject, user, to
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(user, pw.replace(" ", ""))
+            s.sendmail(user, [to], msg.as_string())
+        print("Email sent to", to)
+    except Exception as e:
+        print("Email failed:", e)
 
 
 def main():
+    t0 = time.time()
     state = load_state()
     coins = small_coins()
     print(f"Scanning {len(coins)} small spot coins...")
     hits = []
-    for sym, vol24 in coins:
+
+    def work(item):
+        sym, vol24 = item
         try:
             sp = check_spike(sym)
-            if not sp:
-                continue
-            if time.time() - state.get(sym, 0) < COOLDOWN_HOURS * 3600:
-                continue
+            if not sp or time.time() - state.get(sym, 0) < COOLDOWN_HOURS * 3600:
+                return None
             verdict, score, good, bad = analyze_quality(sym, sp)
-            hits.append((score, sym, vol24, sp, verdict, good, bad))
-            state[sym] = time.time()
+            return (score, sym, vol24, sp, verdict, good, bad)
         except Exception as e:
             print("skip", sym, e)
-        time.sleep(0.07)  # stay under Bitget rate limits
+            return None
+
+    # 5 coins in parallel — much faster, still under Bitget's 20 requests/sec limit
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for res in pool.map(work, coins):
+            if res:
+                hits.append(res)
+                state[res[1]] = time.time()
+    print(f"Done in {time.time() - t0:.0f}s, {len(hits)} hits")
 
     save_state(state)
     if not hits:
@@ -238,7 +265,7 @@ def main():
         )
     body = "\n".join(lines) + "\nتنبيه: مش نصيحة استثمارية — راجع الشارت بنفسك قبل الدخول."
     real = sum(1 for h in hits if h[4].startswith("✅"))
-    send_email(f"Bitget: {len(hits)} قفزة فوليوم ({real} محتمل حقيقي)", body)
+    send_email(f"Bitget: {len(hits)} قفزة فوليوم ({real} محتمل حقيقي)", body, urgent=real > 0)
 
 
 if __name__ == "__main__":
