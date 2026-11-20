@@ -107,6 +107,8 @@ def analyze(item, a):
             "ratio": ratio,
             "recent_usd": recent_total,
             "baseline_per_candle": baseline,
+            "avg_recent": recent_total / k,
+            "price": c,
             "move": move,
             "range": rng,
             "active": active,
@@ -134,6 +136,8 @@ def enrich(r, a):
             sell += usd
     tot = buy + sell
     r["buy_pct"] = buy / tot * 100 if tot else 0.0
+    r["trades"] = len(sizes)
+    r["bid_usd"] = r["ask_usd"] = 0.0
     r["botlike"] = False
     if len(sizes) >= 30:
         m = statistics.mean(sizes)
@@ -152,6 +156,7 @@ def enrich(r, a):
         b = sum(p * q for p, q in bids if p >= lo)
         k = sum(p * q for p, q in asks if p <= hi)
         r["book_pct"] = b / (b + k) * 100 if (b + k) else 0.0
+        r["bid_usd"], r["ask_usd"] = b, k
         r["spread"] = (asks[0][0] / bids[0][0] - 1) * 100
 
     r["strong"] = (
@@ -198,6 +203,40 @@ def print_table(results, a):
     print()
 
 
+def fmt_price(p):
+    if p >= 1:
+        s = f"{p:.4f}"
+    elif p >= 0.01:
+        s = f"{p:.5f}"
+    else:
+        s = f"{p:.8f}"
+    return s.rstrip("0").rstrip(".")
+
+
+def format_alert(r, a):
+    """شكل التنبيه: الحكم + الأرقام + الأسباب + لينك Bitget."""
+    if r["strong"]:
+        tag = "✅ محتمل حقيقي"
+    elif r["botlike"]:
+        tag = "🤖 شبهة بوت"
+    else:
+        tag = "⚠️ ضعيف"
+    reasons = f"إيجابي: الشراء غالب {r['buy_pct']:.0f}%"
+    if not r["botlike"]:
+        reasons += f"، أحجام الصفقات متنوعة ({r['trades']} صفقة)"
+    reasons += f"، طلبات شراء تحت السعر (${r['bid_usd']:,.0f})"
+    reasons += f"، الفوليوم عالي في {r['active']} من آخر {a.window} شموع"
+    return "\n".join(
+        [
+            f"{tag}  {r['symbol']}",
+            f"الفوليوم: ${r['baseline_per_candle']:,.0f} ← ${r['avg_recent']:,.0f} (x{r['ratio']:.1f})",
+            f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}  |  فوليوم 24س: ${r['vol24']:,.0f}",
+            reasons,
+            f"https://www.bitget.com/spot/{r['symbol']}",
+        ]
+    )
+
+
 def telegram(msg):
     tok, chat = os.getenv("TG_TOKEN"), os.getenv("TG_CHAT")
     if not tok or not chat:
@@ -205,7 +244,7 @@ def telegram(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{tok}/sendMessage",
-            data={"chat_id": chat, "text": msg},
+            data={"chat_id": chat, "text": msg[:4000]},
             timeout=10,
         )
     except Exception:
@@ -238,7 +277,7 @@ def send_ntfy(body):
     try:
         requests.post(
             f"https://ntfy.sh/{topic}",
-            data=body.encode("utf-8"),
+            data=body.encode("utf-8")[:3900].decode("utf-8", "ignore").encode("utf-8"),
             headers={"Title": "Bitget scanner", "Priority": "high", "Tags": "mag"},
             timeout=10,
         )
@@ -304,14 +343,11 @@ def main():
         now = time.time()
         fresh = [r for r in results if now - seen.get(r["symbol"], 0) >= a.cooldown]
         if fresh:
-            lines = ["🔎 عملات حجمها قفز والسعر لسه هادي:"]
+            blocks = []
             for r in fresh[:10]:
-                lines.append(
-                    f"{r['symbol']} | حجم x{r['ratio']:.1f} | ${r['recent_usd']:,.0f} | "
-                    f"حركة {r['move']:.2f}% | شراء {r['buy_pct']:.0f}% | دفتر {r['book_pct']:.0f}%"
-                )
+                blocks.append(format_alert(r, a))
                 seen[r["symbol"]] = now
-            notify("\n".join(lines))
+            notify("\n\n".join(blocks))
         seen = {k: v for k, v in seen.items() if now - v < 86400}
         save_state(a.state, seen)
         if not a.loop:
