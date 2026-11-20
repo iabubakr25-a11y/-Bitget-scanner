@@ -1,8 +1,7 @@
 name: Bitget Scanner
-
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -12,35 +11,31 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Restore memory (avoid repeat alerts)
+      - run: pip install requests
+      - name: restore state
         uses: actions/cache/restore@v4
         with:
           path: state.json
           key: scanner-state-${{ github.run_id }}
           restore-keys: scanner-state-
-
-      - name: Install
-        run: pip install requests
-
       - name: Run scanner
         env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state.json
-
-      - name: Save memory
-        if: always()
+        run: python scanner.py --state state.json --loop 30 --duration 3000 --workers 12
+      - name: save state
         uses: actions/cache/save@v4
+        if: always()
         with:
           path: state.json
           key: scanner-state-${{ github.run_id }}
