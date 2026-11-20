@@ -58,7 +58,7 @@ def get_candidates(a, data=None):
     out = []
     for t in data:
         sym = t.get("symbol", "")
-        if not sym.endswith("USDT"):
+        if not sym.endswith("USDT") or sym in a.excl:
             continue
         try:
             vol24 = float(t.get("usdtVolume") or t.get("quoteVolume") or 0)
@@ -302,7 +302,7 @@ def track_pumps(tickers, a, state, now):
     cands, live = [], set()
     for t in tickers:
         sym = t.get("symbol", "")
-        if not sym.endswith("USDT"):
+        if not sym.endswith("USDT") or sym in a.excl:
             continue
         try:
             price = float(t.get("lastPr") or t.get("close") or 0)
@@ -489,9 +489,11 @@ def main():
     p.add_argument("--pump-step", type=float, default=3.0, help="كل كام %% صعود إضافي يتكرر التنبيه لنفس العملة")
     p.add_argument("--pump-window", type=int, default=60, help="مدة قياس الصعود بالدقايق (من مضاعفات 5)")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
+    p.add_argument("--exclude", default="RBRAIUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
     p.add_argument("--no-pump", action="store_true", help="إيقاف تتبع الصعود")
     p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
     a = p.parse_args()
+    a.excl = {x.strip().upper() for x in a.exclude.split(",") if x.strip()}
     a.tfm = tf_minutes(a.tf)
     a.wins = sorted({int(x) for x in a.windows.split(",") if x.strip()})
     # حدود "المخفي" بتتحفظ للتصنيف، وبعدين الفلاتر بتتفتح عشان العملات الظاهرة تتراقب كمان
@@ -532,7 +534,13 @@ def main():
             print(f"تتبع الصعود: {len(pumps)} عملة صعدت {a.pump_pct:g}%+")
             if pumps:
                 with ThreadPoolExecutor(max_workers=a.workers) as ex:
-                    pumps[:8] = list(ex.map(lambda r: enrich(r, a), pumps[:8]))
+                    pumps = list(ex.map(lambda r: enrich(r, a), pumps[:8]))
+                # عملة مفيهاش صفقات ولا أوردر بوك (غالباً سهم مرمّز أو سوق مش حقيقي) نتجاهلها
+                skipped = [r["symbol"] for r in pumps if not (r["trades"] or r["bid_usd"] or r["ask_usd"])]
+                if skipped:
+                    print("تجاهل (مفيش بيانات تداول):", ", ".join(skipped))
+                pumps = [r for r in pumps if r["trades"] or r["bid_usd"] or r["ask_usd"]]
+            if pumps:
                 notify(
                     "\n\n".join(format_pump(r) for r in pumps[:8]),
                     subject="Bitget scanner: عملات صعدت",
