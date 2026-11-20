@@ -1,72 +1,572 @@
-name: Bitget Scanner
-on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+#!/usr/bin/env python3
+"""
+Bitget Stealth Volume Scanner
+-----------------------------
+بيدور على عملات حجم تداولها قفز فجأة بالنسبة لمتوسطها الطبيعي
+لكن السعر لسه ما اتحركش (تجميع محتمل).
 
-concurrency:
-  group: bitget-scanner
-  cancel-in-progress: false
+التشغيل:
+    pip install requests
+    python bitget_scanner.py                 # مسح مرة واحدة
+    python bitget_scanner.py --loop 300      # مسح كل 5 دقايق
+    python bitget_scanner.py --ratio 5 --max-move 1.5 --min-usd 1500
 
-jobs:
-  pump:
-    runs-on: ubuntu-latest
-    timeout-minutes: 62
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install requests
-      - name: restore state
-        uses: actions/cache/restore@v4
-        with:
-          path: state-pump.json
-          key: scanner-pump-${{ github.run_id }}
-          restore-keys: scanner-pump-
-      - name: Run pump tracker
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT: ${{ secrets.TG_CHAT }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state-pump.json --no-vol --loop 20 --duration 3000 --workers 12
-      - name: save state
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: state-pump.json
-          key: scanner-pump-${{ github.run_id }}
+تنبيهات تيليجرام (اختياري):
+    export TG_TOKEN="..."  TG_CHAT="..."
+"""
+import argparse
+import json
+import os
+import smtplib
+import ssl
+import statistics
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-  volume:
-    runs-on: ubuntu-latest
-    timeout-minutes: 62
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install requests
-      - name: restore state
-        uses: actions/cache/restore@v4
-        with:
-          path: state-vol.json
-          key: scanner-vol-${{ github.run_id }}
-          restore-keys: scanner-vol-
-      - name: Run volume scanner
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT: ${{ secrets.TG_CHAT }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state-vol.json --no-pump --loop 30 --duration 3000 --workers 12
-      - name: save state
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: state-vol.json
-          key: scanner-vol-${{ github.run_id }}
+from email.message import EmailMessage
+
+import requests
+
+BASE = "https://api.bitget.com"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "stealth-scanner/1.0"})
+
+
+def api_get(path, params=None, retries=3):
+    for i in range(retries):
+        try:
+            r = SESSION.get(BASE + path, params=params, timeout=10)
+            if r.status_code == 429:
+                time.sleep(1 + i)
+                continue
+            r.raise_for_status()
+            j = r.json()
+            if j.get("code") != "00000":
+                raise RuntimeError(j.get("msg"))
+            return j["data"]
+        except Exception:
+            if i == retries - 1:
+                return None
+            time.sleep(0.5 * (i + 1))
+    return None
+
+
+def get_candidates(a, data=None):
+    """فلترة أولية من التيكرز: عملات USDT صغيرة الحجم وسعرها هادي في 24 ساعة."""
+    if data is None:
+        data = api_get("/api/v2/spot/market/tickers") or []
+    out = []
+    for t in data:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT") or sym in a.excl:
+            continue
+        try:
+            vol24 = float(t.get("usdtVolume") or t.get("quoteVolume") or 0)
+            chg24 = float(t.get("change24h") or 0) * 100
+        except ValueError:
+            continue
+        if a.min_vol24 <= vol24 <= a.max_vol24 and abs(chg24) <= a.max_24h:
+            out.append((sym, vol24, chg24))
+    return out
+
+
+def tf_minutes(tf):
+    t = tf.lower()
+    if t.endswith("min"):
+        return int(t[:-3])
+    if t.endswith("h"):
+        return int(t[:-1]) * 60
+    return 15
+
+
+def analyze(item, a):
+    """بيقيس قفزة الفوليوم على أكتر من مدة (من شمعة واحدة لحد ساعة)،
+    ويرجّع المدة اللي فيها القفزة أقوى."""
+    sym, vol24, chg24 = item
+    raw = api_get(
+        "/api/v2/spot/market/candles",
+        {"symbol": sym, "granularity": a.tf, "limit": "200"},
+    )
+    kmax = max(a.wins)
+    if not raw or len(raw) < kmax + 40:
+        return None
+
+    # [ts, open, high, low, close, baseVol, usdtVol, quoteVol]
+    rows = sorted(raw, key=lambda c: int(c[0]))
+    base_vols = [float(r[6]) for r in rows[:-kmax]]
+    baseline = max(
+        statistics.median(base_vols),
+        statistics.mean(base_vols) * 0.5,
+        a.floor,
+    )
+    best = None
+    for k in a.wins:
+        recent = rows[-k:]
+        total = sum(float(r[6]) for r in recent)
+        ratio = (total / k) / baseline
+        o = float(recent[0][1])
+        c = float(recent[-1][4])
+        hi = max(float(r[2]) for r in recent)
+        lo = min(float(r[3]) for r in recent)
+        if o <= 0 or lo <= 0:
+            continue
+        move = (c / o - 1) * 100
+        rng = (hi / lo - 1) * 100
+        # عدد الشموع النشطة (حجم أكبر من ضعف الطبيعي)
+        active = sum(1 for r in recent if float(r[6]) > 2 * baseline)
+        if (
+            ratio >= a.ratio
+            and total >= a.min_usd
+            and abs(move) <= a.max_move
+            and rng <= a.max_range
+            and active >= a.min_active
+            and (best is None or ratio > best["ratio"])
+        ):
+            mins = k * a.tfm
+            best = {
+                "symbol": sym,
+                "ratio": ratio,
+                "recent_usd": total,
+                "baseline_per_candle": baseline,
+                "avg_recent": total / k,
+                "price": c,
+                "move": move,
+                "range": rng,
+                "active": active,
+                "k": k,
+                "mins": mins,
+                "vol_rate": total / mins * 60,  # معدل الفوليوم في الساعة
+                "vol24": vol24,
+                "chg24": chg24,
+                "hidden": abs(move) <= a.h_move and rng <= a.h_range and abs(chg24) <= a.h_24,
+            }
+    return best
+
+
+def enrich(r, a):
+    """مرحلة التأكيد: اتجاه الشراء العدواني + عمق الأوردر بوك + فحص البوتات."""
+    sym = r["symbol"]
+    fills = api_get("/api/v2/spot/market/fills", {"symbol": sym, "limit": "100"}) or []
+    buy = sell = 0.0
+    sizes = []
+    for f in fills:
+        try:
+            usd = float(f["price"]) * float(f["size"])
+        except (KeyError, ValueError):
+            continue
+        sizes.append(usd)
+        if str(f.get("side", "")).lower() == "buy":
+            buy += usd
+        else:
+            sell += usd
+    tot = buy + sell
+    r["buy_pct"] = buy / tot * 100 if tot else 0.0
+    r["buy_usd"], r["sell_usd"] = buy, sell
+    r["trades"] = len(sizes)
+    r["bid_usd"] = r["ask_usd"] = 0.0
+    r["botlike"] = False
+    if len(sizes) >= 30:
+        m = statistics.mean(sizes)
+        r["botlike"] = m > 0 and statistics.pstdev(sizes) / m < 0.15
+
+    ob = api_get("/api/v2/spot/market/orderbook", {"symbol": sym, "type": "step0", "limit": "50"}) or {}
+    try:
+        bids = [(float(x[0]), float(x[1])) for x in ob.get("bids", [])]
+        asks = [(float(x[0]), float(x[1])) for x in ob.get("asks", [])]
+    except (ValueError, IndexError):
+        bids, asks = [], []
+    r["book_pct"], r["spread"] = 0.0, 99.0
+    if bids and asks:
+        mid = (bids[0][0] + asks[0][0]) / 2
+        lo, hi = mid * (1 - a.depth / 100), mid * (1 + a.depth / 100)
+        b = sum(p * q for p, q in bids if p >= lo)
+        k = sum(p * q for p, q in asks if p <= hi)
+        r["book_pct"] = b / (b + k) * 100 if (b + k) else 0.0
+        r["bid_usd"], r["ask_usd"] = b, k
+        r["spread"] = (asks[0][0] / bids[0][0] - 1) * 100
+
+    r["strong"] = (
+        r["buy_pct"] >= a.min_buy
+        and r["book_pct"] >= a.min_book
+        and r["spread"] <= a.max_spread
+        and not r["botlike"]
+    )
+    return r
+
+
+def scan(a, tickers=None):
+    cands = get_candidates(a, tickers)
+    print(f"[{time.strftime('%H:%M:%S')}] عملات بعد الفلترة الأولية: {len(cands)}")
+    results = []
+    with ThreadPoolExecutor(max_workers=a.workers) as ex:
+        for res in ex.map(lambda it: analyze(it, a), cands):
+            if res:
+                results.append(res)
+    if results:
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            results = list(ex.map(lambda r: enrich(r, a), results))
+    if not a.weak:
+        results = [r for r in results if r["strong"]]
+    results.sort(key=lambda r: (r["strong"], r["ratio"]), reverse=True)
+    return results
+
+
+def print_table(results, a):
+    if not results:
+        print("مفيش حاجة مطابقة للشروط دلوقتي.\n")
+        return
+    print(
+        f"{'SYMBOL':<14}{'VOLx':>7}{'RECENT$':>10}{'MOVE%':>8}"
+        f"{'BUY%':>7}{'BOOK%':>7}{'SPRD%':>7}  FLAG"
+    )
+    for r in results[: a.top]:
+        flag = "STRONG" if r["strong"] else ("BOT?" if r["botlike"] else "weak")
+        print(
+            f"{r['symbol']:<14}{r['ratio']:>7.1f}{r['recent_usd']:>10,.0f}"
+            f"{r['move']:>8.2f}{r['buy_pct']:>7.0f}{r['book_pct']:>7.0f}"
+            f"{r['spread']:>7.2f}  {flag}"
+        )
+    print()
+
+
+def fmt_price(p):
+    if p >= 1:
+        s = f"{p:.4f}"
+    elif p >= 0.01:
+        s = f"{p:.5f}"
+    else:
+        s = f"{p:.8f}"
+    return s.rstrip("0").rstrip(".")
+
+
+def format_alert(r, a):
+    """شكل التنبيه: الحكم + الأرقام + الأسباب + لينك Bitget."""
+    if r["strong"]:
+        tag = "✅ محتمل حقيقي"
+    elif r["botlike"]:
+        tag = "🤖 شبهة بوت"
+    else:
+        tag = "⚠️ ضعيف"
+    reasons = f"إيجابي: الشراء غالب {r['buy_pct']:.0f}%"
+    if not r["botlike"]:
+        reasons += f"، أحجام الصفقات متنوعة ({r['trades']} صفقة)"
+    reasons += f"، طلبات شراء تحت السعر (${r['bid_usd']:,.0f})"
+    reasons += f"، الفوليوم عالي في {r['active']} من آخر {r['k']} شموع"
+    kind = "🕶 مخفي" if r["hidden"] else f"📢 ظاهر (السعر اتحرك {r['move']:+.1f}%)"
+    if r.get("repeat"):
+        kind += " 🔁 فوليوم مكمل"
+    return "\n".join(
+        [
+            f"{tag}  {r['symbol']}  |  {kind}",
+            f"الفوليوم في آخر {r['mins']} دقيقة: ${r['recent_usd']:,.0f} (الطبيعي لنفس المدة ${r['baseline_per_candle'] * r['k']:,.0f}) x{r['ratio']:.1f}",
+            f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}",
+            f"آخر {r['trades']} صفقة: شراء ${r['buy_usd']:,.0f} مقابل بيع ${r['sell_usd']:,.0f}",
+            reasons,
+            f"https://www.bitget.com/spot/{r['symbol']}",
+        ]
+    )
+
+
+def candle_pump(sym, a, now):
+    """شمعة (دقيقة افتراضياً) أقفلت خضرا فوق أعلى الشمعة اللي قبلها،
+    والسعر زاد pump_pct% عن أقل جسم شمعة في آخر pump_window دقيقة."""
+    m = a.ptfm
+    n = a.pump_window // m + 1
+    raw = api_get("/api/v2/spot/market/candles", {"symbol": sym, "granularity": a.pump_tf, "limit": str(n + 3)})
+    if not raw or len(raw) < 4:
+        return None
+    rows = sorted(raw, key=lambda c: int(c[0]))
+    if int(rows[-1][0]) / 1000 + m * 60 > now:  # آخر شمعة لسه بتتكون، نشيلها
+        rows = rows[:-1]
+    if len(rows) < 3:
+        return None
+    last, prev = rows[-1], rows[-2]
+    o, c, prev_high = float(last[1]), float(last[4]), float(prev[2])
+    win = rows[-n:]
+    low, low_ts = min((min(float(r[1]), float(r[4])), int(r[0])) for r in win)
+    if low <= 0:
+        return None
+    rise = (c / low - 1) * 100
+    if c > o and c > prev_high and rise >= a.pump_pct:
+        return {"price": c, "rise": rise, "mins": (int(last[0]) - low_ts) / 60000 + m}
+    return None
+
+
+def track_pumps(tickers, a, state, now):
+    """تتبع الصعود: عملة صعدت pump_pct% وشمعة الـ5 دقايق أقفلت فوق الشمعة اللي قبلها.
+    وتتكرر نفس العملة كل ما تكمل صعود pump_step% فوق سعر آخر تنبيه."""
+    if not tickers:
+        return []
+    hist = state.setdefault("hist", {})
+    last = state.setdefault("pump", {})
+    window = a.pump_window * 60
+    cands, live = [], set()
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT") or sym in a.excl:
+            continue
+        try:
+            price = float(t.get("lastPr") or t.get("close") or 0)
+            vol24 = float(t.get("usdtVolume") or t.get("quoteVolume") or 0)
+            chg24 = float(t.get("change24h") or 0) * 100
+        except ValueError:
+            continue
+        if price <= 0:
+            continue
+        if vol24 < a.pump_min_vol24:
+            continue
+        live.add(sym)
+        h = [p for p in hist.get(sym, []) if now - p[0] <= window]
+        if not h or now - h[-1][0] >= 55:  # نقطة سعر كل دقيقة تقريباً بس (يخفف حجم الملف)
+            h.append([now, price])
+        hist[sym] = h
+        low = min(min(p[1] for p in h), price)
+        hist_rise = (price / low - 1) * 100
+        # فلتر أولي رخيص عشان منطلبش شموع لكل العملات
+        if hist_rise >= a.pump_pct * 0.5 or sym in last:
+            cands.append((sym, vol24, chg24, price))
+    for s in list(hist):
+        if s not in live:
+            del hist[s]
+    out = []
+    if cands:
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            res = list(ex.map(lambda it: candle_pump(it[0], a, now), cands))
+        for (sym, vol24, chg24, price), r in zip(cands, res):
+            ref = last.get(sym)
+            if ref and (now - ref["ts"] > 6 * 3600 or price <= ref["price"] * (1 - a.pump_pct / 100)):
+                last.pop(sym, None)
+                ref = None
+            if (
+                r
+                and (ref is None or r["price"] >= ref["price"] * (1 + a.pump_step / 100))
+                and (ref is None or now - ref["ts"] >= a.pump_gap)
+            ):
+                out.append(
+                    {
+                        "symbol": sym,
+                        "price": r["price"],
+                        "rise": r["rise"],
+                        "mins": r["mins"],
+                        "vol24": vol24,
+                        "chg24": chg24,
+                        "repeat": ref is not None,
+                        "from_alert": ref["price"] if ref else None,
+                    }
+                )
+                last[sym] = {"price": r["price"], "ts": now}
+    out.sort(key=lambda r: r["rise"], reverse=True)
+    return out
+
+
+def format_pump(r):
+    head = "🚀 كمّلت صعود" if r["repeat"] else "🚀 صعود جديد"
+    lines = [
+        f"{head}  {r['symbol']}",
+        f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  السعر: {fmt_price(r['price'])}",
+        "آخر شمعة أقفلت خضرا فوق أعلى الشمعة اللي قبلها ✅",
+    ]
+    if r["repeat"]:
+        gain = (r["price"] / r["from_alert"] - 1) * 100
+        lines.append(f"زادت {gain:.1f}% عن سعر التنبيه السابق ({fmt_price(r['from_alert'])})")
+    if "buy_pct" in r:
+        flow = f"آخر {r['trades']} صفقة: الشراء {r['buy_pct']:.0f}%  |  سيولة الشراء في الأوردر بوك {r['book_pct']:.0f}%"
+        if r["botlike"]:
+            flow += "  |  🤖 شبهة بوت"
+        lines.append(flow)
+        if r["book_pct"] < 40:
+            lines.append("⚠️ طلبات البيع أكتر من الشراء، احتمال تصريف")
+    lines.append("⚠️ الصعود حصل بالفعل، اتأكد من الشارت قبل أي قرار")
+    lines.append(f"https://www.bitget.com/spot/{r['symbol']}")
+    return "\n".join(lines)
+
+
+def telegram(msg):
+    tok, chat = os.getenv("TG_TOKEN"), os.getenv("TG_CHAT")
+    if not tok or not chat:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            data={"chat_id": chat, "text": msg[:4000]},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def send_email(body, subject="Bitget scanner: عملات حجمها قفز"):
+    user, pwd = os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS")
+    if not user or not pwd:
+        return
+    to = os.getenv("EMAIL_TO") or user
+    host = os.getenv("EMAIL_SMTP", "smtp.gmail.com")
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = to
+        msg.set_content(body)
+        with smtplib.SMTP_SSL(host, 465, context=ssl.create_default_context(), timeout=20) as srv:
+            srv.login(user, pwd)
+            srv.send_message(msg)
+    except Exception as e:
+        print("email failed:", e)
+
+
+def send_ntfy(body, title="Bitget scanner", tags="mag"):
+    topic = os.getenv("NTFY_TOPIC")
+    if not topic:
+        print("ntfy: NTFY_TOPIC مش متضبط")
+        return
+    data = body.encode("utf-8")[:3800].decode("utf-8", "ignore").encode("utf-8")
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://ntfy.sh/{topic}",
+                data=data,
+                headers={"Title": title, "Priority": "high", "Tags": tags},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                print(f"ntfy: اتبعت ({len(data)} بايت)")
+                return
+            print(f"ntfy: فشل HTTP {r.status_code} {r.text[:150]}")
+            if r.status_code != 429:
+                return
+            time.sleep(6)
+        except Exception as e:
+            print("ntfy failed:", e)
+            time.sleep(2)
+
+
+def notify(body, subject="Bitget scanner: عملات حجمها قفز", title="Bitget scanner", tags="mag"):
+    telegram(body)
+    send_email(body, subject)
+    send_ntfy(body, title, tags)
+
+
+def load_state(path):
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(path, state):
+    if not path:
+        return
+    try:
+        with open(path, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--tf", default="5min", help="1min,5min,15min,30min,1h")
+    p.add_argument("--windows", default="1,3,6,12", help="مدد القياس بعدد الشموع (مع 5min: 5 و15 و30 و60 دقيقة)")
+    p.add_argument("--ratio", type=float, default=4.0, help="أقل نسبة قفزة حجم عن الطبيعي")
+    p.add_argument("--min-usd", type=float, default=1000, help="أقل حجم $ في الفترة الحديثة")
+    p.add_argument("--max-move", type=float, default=2.0, help="أقصى حركة سعر%% في الفترة")
+    p.add_argument("--max-range", type=float, default=4.0, help="أقصى مدى high-low%% في الفترة")
+    p.add_argument("--min-active", type=int, default=1, help="أقل عدد شموع نشطة")
+    p.add_argument("--floor", type=float, default=5.0, help="حد أدنى للحجم الطبيعي لكل شمعة $ (يمنع القسمة على صفر)")
+    p.add_argument("--min-vol24", type=float, default=5_000)
+    p.add_argument("--max-vol24", type=float, default=3_000_000)
+    p.add_argument("--max-24h", type=float, default=15.0, help="استبعد العملات اللي اتحركت أكتر من كده في 24س")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--top", type=int, default=25)
+    p.add_argument("--loop", type=int, default=0, help="ثواني بين كل مسح (0 = مرة واحدة)")
+    p.add_argument("--duration", type=int, default=0, help="مع --loop: أقصى مدة تشغيل بالثواني قبل ما يقفل لوحده (0 = بلا حد)")
+    p.add_argument("--cooldown", type=int, default=900, help="ثواني قبل تكرار تنبيه نفس العملة لو الفوليوم لسه عالي")
+    p.add_argument("--vol-step", type=float, default=1.5, help="يكرر التنبيه فوراً لو الفوليوم الحديث زاد بالمعامل ده عن آخر تنبيه")
+    p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
+    p.add_argument("--min-buy", type=float, default=58, help="أقل نسبة شراء عدواني %%")
+    p.add_argument("--min-book", type=float, default=52, help="أقل نسبة سيولة bid في الأوردر بوك %%")
+    p.add_argument("--max-spread", type=float, default=1.5, help="أقصى سبريد bid/ask %%")
+    p.add_argument("--depth", type=float, default=2.0, help="عمق الأوردر بوك المحسوب حوالين السعر %%")
+    p.add_argument("--weak", action="store_true", help="اعرض كمان العملات الضعيفة (للتجربة)")
+    p.add_argument("--pump-pct", type=float, default=5.0, help="نسبة الصعود اللي تطلّع تنبيه %%")
+    p.add_argument("--pump-step", type=float, default=3.0, help="كل كام %% صعود إضافي يتكرر التنبيه لنفس العملة")
+    p.add_argument("--pump-window", type=int, default=60, help="مدة قياس الصعود بالدقايق")
+    p.add_argument("--pump-tf", default="1min", help="فريم شموع تتبع الصعود: 1min أو 5min")
+    p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
+    p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
+    p.add_argument("--exclude", default="RBRAIUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
+    p.add_argument("--no-vol", action="store_true", help="إيقاف فحص الفوليوم (يبقى تتبع الصعود بس، أسرع)")
+    p.add_argument("--no-pump", action="store_true", help="إيقاف تتبع الصعود")
+    p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
+    a = p.parse_args()
+    a.excl = {x.strip().upper() for x in a.exclude.split(",") if x.strip()}
+    a.tfm = tf_minutes(a.tf)
+    a.ptfm = tf_minutes(a.pump_tf)
+    a.wins = sorted({int(x) for x in a.windows.split(",") if x.strip()})
+    # حدود "المخفي" بتتحفظ للتصنيف، وبعدين الفلاتر بتتفتح عشان العملات الظاهرة تتراقب كمان
+    a.h_move, a.h_range, a.h_24 = a.max_move, a.max_range, a.max_24h
+    if not a.hidden_only:
+        a.max_move = a.max_range = a.max_24h = 10_000.0
+        a.max_vol24 = max(a.max_vol24, 100_000_000.0)
+
+    st = load_state(a.state)
+    if "seen" not in st:
+        st = {"seen": {k: v for k, v in st.items() if isinstance(v, (int, float))}}
+    for k, v in list(st["seen"].items()):
+        if isinstance(v, (int, float)):
+            st["seen"][k] = {"ts": v, "vol": 0}
+    seen = st["seen"]
+    start = time.time()
+    while True:
+        tickers = api_get("/api/v2/spot/market/tickers") or []
+        results = [] if a.no_vol else scan(a, tickers)
+        if not a.no_vol:
+            print_table(results, a)
+        now = time.time()
+        fresh = []
+        for r in results:
+            prev = seen.get(r["symbol"])
+            if prev is None:
+                fresh.append(r)
+            elif now - prev["ts"] >= a.cooldown or r["vol_rate"] >= prev["vol"] * a.vol_step:
+                r["repeat"] = True
+                fresh.append(r)
+        if fresh:
+            blocks = []
+            for r in fresh[:10]:
+                blocks.append(format_alert(r, a))
+                seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"]}
+            notify("\n\n".join(blocks))
+        if not a.no_pump:
+            pumps = track_pumps(tickers, a, st, now)
+            print(f"تتبع الصعود: {len(pumps)} عملة صعدت {a.pump_pct:g}%+")
+            if pumps:
+                with ThreadPoolExecutor(max_workers=a.workers) as ex:
+                    pumps = list(ex.map(lambda r: enrich(r, a), pumps[:8]))
+                # عملة مفيهاش صفقات ولا أوردر بوك (غالباً سهم مرمّز أو سوق مش حقيقي) نتجاهلها
+                skipped = [r["symbol"] for r in pumps if not (r["trades"] or r["bid_usd"] or r["ask_usd"])]
+                if skipped:
+                    print("تجاهل (مفيش بيانات تداول):", ", ".join(skipped))
+                pumps = [r for r in pumps if r["trades"] or r["bid_usd"] or r["ask_usd"]]
+            if pumps:
+                notify(
+                    "\n\n".join(format_pump(r) for r in pumps[:8]),
+                    subject="Bitget scanner: عملات صعدت",
+                    title="Bitget pump",
+                    tags="rocket",
+                )
+        seen = {k: v for k, v in seen.items() if now - v["ts"] < 86400}
+        st["seen"] = seen
+        save_state(a.state, st)
+        if not a.loop:
+            break
+        if a.duration and time.time() - start >= a.duration:
+            break
+        time.sleep(a.loop)
+
+
+if __name__ == "__main__":
+    main()
