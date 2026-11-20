@@ -1,0 +1,46 @@
+name: Bitget Scanner
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Send a test email even if no spikes"
+        default: "1"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore memory (avoid repeat alerts)
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: scanner-state-
+
+      - name: Install
+        run: pip install requests
+
+      - name: Run scanner
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TEST_EMAIL: ${{ github.event.inputs.test_email }}
+        run: python scanner.py
+
+      - name: Save memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
