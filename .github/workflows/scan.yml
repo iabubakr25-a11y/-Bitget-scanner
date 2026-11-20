@@ -4,10 +4,6 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
-    inputs:
-      test_email:
-        description: "Send a test email even if no spikes"
-        default: "1"
 
 concurrency:
   group: bitget-scanner
@@ -40,7 +36,7 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py
+        run: python scanner.py --state state.json
 
       - name: Save memory
         if: always()
