@@ -307,7 +307,7 @@ def track_pumps(tickers, a, state, now):
         low = min(p[1] for p in h)
         hist_rise = (price / low - 1) * 100
         # فلتر أولي رخيص عشان منطلبش شموع لكل العملات
-        if hist_rise >= a.pump_pct * 0.5 or sym in last or (len(h) < 3 and chg24 >= a.pump_pct):
+        if hist_rise >= a.pump_pct * 0.5 or sym in last:
             cands.append((sym, vol24, chg24, price))
     for s in list(hist):
         if s not in live:
@@ -398,16 +398,27 @@ def send_email(body, subject="Bitget scanner: عملات حجمها قفز"):
 def send_ntfy(body, title="Bitget scanner", tags="mag"):
     topic = os.getenv("NTFY_TOPIC")
     if not topic:
+        print("ntfy: NTFY_TOPIC مش متضبط")
         return
-    try:
-        requests.post(
-            f"https://ntfy.sh/{topic}",
-            data=body.encode("utf-8")[:3900].decode("utf-8", "ignore").encode("utf-8"),
-            headers={"Title": title, "Priority": "high", "Tags": tags},
-            timeout=10,
-        )
-    except Exception as e:
-        print("ntfy failed:", e)
+    data = body.encode("utf-8")[:3800].decode("utf-8", "ignore").encode("utf-8")
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://ntfy.sh/{topic}",
+                data=data,
+                headers={"Title": title, "Priority": "high", "Tags": tags},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                print(f"ntfy: اتبعت ({len(data)} بايت)")
+                return
+            print(f"ntfy: فشل HTTP {r.status_code} {r.text[:150]}")
+            if r.status_code != 429:
+                return
+            time.sleep(6)
+        except Exception as e:
+            print("ntfy failed:", e)
+            time.sleep(2)
 
 
 def notify(body, subject="Bitget scanner: عملات حجمها قفز", title="Bitget scanner", tags="mag"):
