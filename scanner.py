@@ -70,63 +70,77 @@ def get_candidates(a, data=None):
     return out
 
 
+def tf_minutes(tf):
+    t = tf.lower()
+    if t.endswith("min"):
+        return int(t[:-3])
+    if t.endswith("h"):
+        return int(t[:-1]) * 60
+    return 15
+
+
 def analyze(item, a):
+    """بيقيس قفزة الفوليوم على أكتر من مدة (من شمعة واحدة لحد ساعة)،
+    ويرجّع المدة اللي فيها القفزة أقوى."""
     sym, vol24, chg24 = item
     raw = api_get(
         "/api/v2/spot/market/candles",
         {"symbol": sym, "granularity": a.tf, "limit": "200"},
     )
-    if not raw or len(raw) < a.window + 40:
+    kmax = max(a.wins)
+    if not raw or len(raw) < kmax + 40:
         return None
 
     # [ts, open, high, low, close, baseVol, usdtVol, quoteVol]
     rows = sorted(raw, key=lambda c: int(c[0]))
-    k = a.window
-    recent, base = rows[-k:], rows[:-k]
-
-    base_vols = [float(r[6]) for r in base]
+    base_vols = [float(r[6]) for r in rows[:-kmax]]
     baseline = max(
         statistics.median(base_vols),
         statistics.mean(base_vols) * 0.5,
         a.floor,
     )
-    recent_total = sum(float(r[6]) for r in recent)
-    ratio = (recent_total / k) / baseline
-
-    o = float(recent[0][1])
-    c = float(recent[-1][4])
-    hi = max(float(r[2]) for r in recent)
-    lo = min(float(r[3]) for r in recent)
-    if o <= 0 or lo <= 0:
-        return None
-    move = (c / o - 1) * 100
-    rng = (hi / lo - 1) * 100
-
-    # عدد الشموع النشطة (حجم أكبر من ضعف الطبيعي) — تجميع مستمر مش شمعة واحدة
-    active = sum(1 for r in recent if float(r[6]) > 2 * baseline)
-
-    if (
-        ratio >= a.ratio
-        and recent_total >= a.min_usd
-        and abs(move) <= a.max_move
-        and rng <= a.max_range
-        and active >= a.min_active
-    ):
-        return {
-            "symbol": sym,
-            "ratio": ratio,
-            "recent_usd": recent_total,
-            "baseline_per_candle": baseline,
-            "avg_recent": recent_total / k,
-            "price": c,
-            "move": move,
-            "range": rng,
-            "active": active,
-            "vol24": vol24,
-            "chg24": chg24,
-            "hidden": abs(move) <= a.h_move and rng <= a.h_range and abs(chg24) <= a.h_24,
-        }
-    return None
+    best = None
+    for k in a.wins:
+        recent = rows[-k:]
+        total = sum(float(r[6]) for r in recent)
+        ratio = (total / k) / baseline
+        o = float(recent[0][1])
+        c = float(recent[-1][4])
+        hi = max(float(r[2]) for r in recent)
+        lo = min(float(r[3]) for r in recent)
+        if o <= 0 or lo <= 0:
+            continue
+        move = (c / o - 1) * 100
+        rng = (hi / lo - 1) * 100
+        # عدد الشموع النشطة (حجم أكبر من ضعف الطبيعي)
+        active = sum(1 for r in recent if float(r[6]) > 2 * baseline)
+        if (
+            ratio >= a.ratio
+            and total >= a.min_usd
+            and abs(move) <= a.max_move
+            and rng <= a.max_range
+            and active >= a.min_active
+            and (best is None or ratio > best["ratio"])
+        ):
+            mins = k * a.tfm
+            best = {
+                "symbol": sym,
+                "ratio": ratio,
+                "recent_usd": total,
+                "baseline_per_candle": baseline,
+                "avg_recent": total / k,
+                "price": c,
+                "move": move,
+                "range": rng,
+                "active": active,
+                "k": k,
+                "mins": mins,
+                "vol_rate": total / mins * 60,  # معدل الفوليوم في الساعة
+                "vol24": vol24,
+                "chg24": chg24,
+                "hidden": abs(move) <= a.h_move and rng <= a.h_range and abs(chg24) <= a.h_24,
+            }
+    return best
 
 
 def enrich(r, a):
@@ -237,15 +251,15 @@ def format_alert(r, a):
     if not r["botlike"]:
         reasons += f"، أحجام الصفقات متنوعة ({r['trades']} صفقة)"
     reasons += f"، طلبات شراء تحت السعر (${r['bid_usd']:,.0f})"
-    reasons += f"، الفوليوم عالي في {r['active']} من آخر {a.window} شموع"
+    reasons += f"، الفوليوم عالي في {r['active']} من آخر {r['k']} شموع"
     kind = "🕶 مخفي" if r["hidden"] else f"📢 ظاهر (السعر اتحرك {r['move']:+.1f}%)"
     if r.get("repeat"):
         kind += " 🔁 فوليوم مكمل"
     return "\n".join(
         [
             f"{tag}  {r['symbol']}  |  {kind}",
-            f"الفوليوم: ${r['baseline_per_candle']:,.0f} ← ${r['avg_recent']:,.0f} (x{r['ratio']:.1f})",
-            f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}  |  فوليوم 24س: ${r['vol24']:,.0f}",
+            f"الفوليوم في آخر {r['mins']} دقيقة: ${r['recent_usd']:,.0f} (الطبيعي لنفس المدة ${r['baseline_per_candle'] * r['k']:,.0f}) x{r['ratio']:.1f}",
+            f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}",
             f"آخر {r['trades']} صفقة: شراء ${r['buy_usd']:,.0f} مقابل بيع ${r['sell_usd']:,.0f}",
             reasons,
             f"https://www.bitget.com/spot/{r['symbol']}",
@@ -345,7 +359,6 @@ def format_pump(r):
         f"{head}  {r['symbol']}",
         f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  السعر: {fmt_price(r['price'])}",
         "شمعة 5 دقايق أقفلت فوق أعلى الشمعة اللي قبلها ✅",
-        f"فوليوم 24س: ${r['vol24']:,.0f}  |  تغير 24س: {r['chg24']:+.1f}%",
     ]
     if r["repeat"]:
         gain = (r["price"] / r["from_alert"] - 1) * 100
@@ -449,8 +462,8 @@ def save_state(path, state):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--tf", default="15min", help="1min,5min,15min,30min,1h")
-    p.add_argument("--window", type=int, default=4, help="عدد الشموع الحديثة (4 x 15min = ساعة)")
+    p.add_argument("--tf", default="5min", help="1min,5min,15min,30min,1h")
+    p.add_argument("--windows", default="1,3,6,12", help="مدد القياس بعدد الشموع (مع 5min: 5 و15 و30 و60 دقيقة)")
     p.add_argument("--ratio", type=float, default=4.0, help="أقل نسبة قفزة حجم عن الطبيعي")
     p.add_argument("--min-usd", type=float, default=1000, help="أقل حجم $ في الفترة الحديثة")
     p.add_argument("--max-move", type=float, default=2.0, help="أقصى حركة سعر%% في الفترة")
@@ -479,6 +492,8 @@ def main():
     p.add_argument("--no-pump", action="store_true", help="إيقاف تتبع الصعود")
     p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
     a = p.parse_args()
+    a.tfm = tf_minutes(a.tf)
+    a.wins = sorted({int(x) for x in a.windows.split(",") if x.strip()})
     # حدود "المخفي" بتتحفظ للتصنيف، وبعدين الفلاتر بتتفتح عشان العملات الظاهرة تتراقب كمان
     a.h_move, a.h_range, a.h_24 = a.max_move, a.max_range, a.max_24h
     if not a.hidden_only:
@@ -503,14 +518,14 @@ def main():
             prev = seen.get(r["symbol"])
             if prev is None:
                 fresh.append(r)
-            elif now - prev["ts"] >= a.cooldown or r["recent_usd"] >= prev["vol"] * a.vol_step:
+            elif now - prev["ts"] >= a.cooldown or r["vol_rate"] >= prev["vol"] * a.vol_step:
                 r["repeat"] = True
                 fresh.append(r)
         if fresh:
             blocks = []
             for r in fresh[:10]:
                 blocks.append(format_alert(r, a))
-                seen[r["symbol"]] = {"ts": now, "vol": r["recent_usd"]}
+                seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"]}
             notify("\n\n".join(blocks))
         if not a.no_pump:
             pumps = track_pumps(tickers, a, st, now)
