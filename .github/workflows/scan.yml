@@ -9,6 +9,10 @@ on:
         description: "Send a test email even if no spikes"
         default: "1"
 
+concurrency:
+  group: bitget-scanner
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -35,7 +39,7 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          TEST_EMAIL: ${{ github.event.inputs.test_email }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python scanner.py
 
       - name: Save memory
