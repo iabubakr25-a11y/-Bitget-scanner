@@ -463,6 +463,7 @@ def main():
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--top", type=int, default=25)
     p.add_argument("--loop", type=int, default=0, help="ثواني بين كل مسح (0 = مرة واحدة)")
+    p.add_argument("--duration", type=int, default=0, help="مع --loop: أقصى مدة تشغيل بالثواني قبل ما يقفل لوحده (0 = بلا حد)")
     p.add_argument("--cooldown", type=int, default=900, help="ثواني قبل تكرار تنبيه نفس العملة لو الفوليوم لسه عالي")
     p.add_argument("--vol-step", type=float, default=1.5, help="يكرر التنبيه فوراً لو الفوليوم الحديث زاد بالمعامل ده عن آخر تنبيه")
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
@@ -491,6 +492,7 @@ def main():
         if isinstance(v, (int, float)):
             st["seen"][k] = {"ts": v, "vol": 0}
     seen = st["seen"]
+    start = time.time()
     while True:
         tickers = api_get("/api/v2/spot/market/tickers") or []
         results = scan(a, tickers)
@@ -526,6 +528,8 @@ def main():
         st["seen"] = seen
         save_state(a.state, st)
         if not a.loop:
+            break
+        if a.duration and time.time() - start >= a.duration:
             break
         time.sleep(a.loop)
 
