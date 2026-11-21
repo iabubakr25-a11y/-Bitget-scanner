@@ -27,7 +27,7 @@ jobs:
       - name: Run pump tracker
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state-pump.json --no-vol --loop 20 --duration 3000 --workers 12 --pump-tf 1min --big-candle 1.5 --pump-min-candle-usd 200 --confirm-sec 20 --pump-max-age 150
+        run: python scanner.py --state state-pump.json --no-vol --loop 20 --duration 3000 --workers 12 --pump-tf 1min --big-candle 1.5 --pump-min-candle-usd 200 --confirm-sec 20 --pump-max-age 150 --rebound-candles 10
       - name: save state
         uses: actions/cache/save@v4
         if: always()
