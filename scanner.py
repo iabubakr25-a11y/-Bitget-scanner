@@ -268,28 +268,46 @@ def format_alert(r, a):
 
 
 def candle_pump(sym, a, now):
-    """شمعة (دقيقة افتراضياً) أقفلت خضرا فوق أعلى الشمعة اللي قبلها،
-    والسعر زاد pump_pct% عن أقل جسم شمعة في آخر pump_window دقيقة."""
+    """صعود حقيقي بس (مش وهمي): واحد من شرطين على شموع مقفولة:
+    1) شمعة وحدة أقفلت زيادة big_candle% أو أكتر.
+    2) 3 شموع خضرا متتالية كل واحدة بتقفل أعلى من اللي قبلها، والعملة زادت pump_pct% عن أقل سعر في الفترة.
+    ولازم فوليوم الشموع كفاية، وفتيلة الشمعة العلوية مش كبيرة (يعني مش ارتداد من قمة)."""
     m = a.ptfm
     n = a.pump_window // m + 1
-    raw = api_get("/api/v2/spot/market/candles", {"symbol": sym, "granularity": a.pump_tf, "limit": str(n + 3)})
-    if not raw or len(raw) < 4:
+    raw = api_get("/api/v2/spot/market/candles", {"symbol": sym, "granularity": a.pump_tf, "limit": str(max(n, 4) + 3)})
+    if not raw or len(raw) < 5:
         return None
     rows = sorted(raw, key=lambda c: int(c[0]))
     if int(rows[-1][0]) / 1000 + m * 60 > now:  # آخر شمعة لسه بتتكون، نشيلها
         rows = rows[:-1]
-    if len(rows) < 3:
+    if len(rows) < 4:
         return None
-    last, prev = rows[-1], rows[-2]
-    o, c, prev_high = float(last[1]), float(last[4]), float(prev[2])
+    last = rows[-1]
+    o, h, l, c, v = float(last[1]), float(last[2]), float(last[3]), float(last[4]), float(last[6])
+    if o <= 0:
+        return None
+    rng = h - l
+    wick_ok = rng <= 0 or (h - c) / rng <= a.max_wick  # الإغلاق قريب من القمة
     win = rows[-n:]
     low, low_ts = min((min(float(r[1]), float(r[4])), int(r[0])) for r in win)
     if low <= 0:
         return None
     rise = (c / low - 1) * 100
-    if c > o and c > prev_high and rise >= a.pump_pct:
-        return {"price": c, "rise": rise, "mins": (int(last[0]) - low_ts) / 60000 + m}
-    return None
+    gain = (c / o - 1) * 100
+    big = gain >= a.big_candle and v >= a.pump_min_candle_usd and wick_ok
+    r3 = rows[-3:]
+    closes = [float(x[4]) for x in r3]
+    three = (
+        all(float(x[4]) > float(x[1]) for x in r3)
+        and closes[0] < closes[1] < closes[2]
+        and rise >= a.pump_pct
+        and sum(float(x[6]) for x in r3) >= a.pump_min_candle_usd
+        and wick_ok
+    )
+    if not (big or three):
+        return None
+    why = f"شمعة {m} دقايق أقفلت +{gain:.1f}%" if big else "3 شموع خضرا متتالية بإغلاق أعلى"
+    return {"price": c, "rise": rise, "mins": (int(last[0]) - low_ts) / 60000 + m, "why": why}
 
 
 def track_pumps(tickers, a, state, now):
@@ -323,7 +341,7 @@ def track_pumps(tickers, a, state, now):
         low = min(min(p[1] for p in h), price)
         hist_rise = (price / low - 1) * 100
         # فلتر أولي رخيص عشان منطلبش شموع لكل العملات
-        if hist_rise >= a.pump_pct * 0.5 or sym in last:
+        if hist_rise >= min(a.pump_pct, a.big_candle) * 0.5 or sym in last:
             cands.append((sym, vol24, chg24, price))
     for s in list(hist):
         if s not in live:
@@ -348,6 +366,7 @@ def track_pumps(tickers, a, state, now):
                         "price": r["price"],
                         "rise": r["rise"],
                         "mins": r["mins"],
+                        "why": r["why"],
                         "vol24": vol24,
                         "chg24": chg24,
                         "repeat": ref is not None,
@@ -364,7 +383,7 @@ def format_pump(r):
     lines = [
         f"{head}  {r['symbol']}",
         f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  السعر: {fmt_price(r['price'])}",
-        "آخر شمعة أقفلت خضرا فوق أعلى الشمعة اللي قبلها ✅",
+        f"✅ {r['why']}",
     ]
     if r["repeat"]:
         gain = (r["price"] / r["from_alert"] - 1) * 100
@@ -494,7 +513,10 @@ def main():
     p.add_argument("--pump-pct", type=float, default=5.0, help="نسبة الصعود اللي تطلّع تنبيه %%")
     p.add_argument("--pump-step", type=float, default=3.0, help="كل كام %% صعود إضافي يتكرر التنبيه لنفس العملة")
     p.add_argument("--pump-window", type=int, default=60, help="مدة قياس الصعود بالدقايق")
-    p.add_argument("--pump-tf", default="1min", help="فريم شموع تتبع الصعود: 1min أو 5min")
+    p.add_argument("--pump-tf", default="5min", help="فريم شموع تتبع الصعود: 1min أو 5min")
+    p.add_argument("--big-candle", type=float, default=3.0, help="شمعة وحدة مقفولة زادت كده%% = صعود لحظي")
+    p.add_argument("--pump-min-candle-usd", type=float, default=300, help="أقل فوليوم $ لشمعة الصعود (يمنع الصعود الوهمي على صفقة واحدة)")
+    p.add_argument("--max-wick", type=float, default=0.4, help="أقصى نسبة للفتيلة العلوية من الشمعة (أكتر منها = ارتداد/فخ)")
     p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
     p.add_argument("--exclude", default="RBRAIUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
