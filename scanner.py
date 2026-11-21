@@ -170,6 +170,14 @@ def enrich(r, a):
     r["buy_pct"] = buy / tot * 100 if tot else 0.0
     r["buy_usd"], r["sell_usd"] = buy, sell
     r["trades"] = len(sizes)
+    tss = []
+    for f in fills:
+        try:
+            tss.append(int(f["ts"]))
+        except (KeyError, ValueError, TypeError):
+            pass
+    # الصفقات بتغطي آخر كام دقيقة بس (العينة ممكن تكون أقصر من فترة الفوليوم كلها)
+    r["fills_min"] = (time.time() * 1000 - min(tss)) / 60000 if tss else None
     r["bid_usd"] = r["ask_usd"] = 0.0
     r["botlike"] = False
     if len(sizes) >= 30:
@@ -202,6 +210,36 @@ def enrich(r, a):
     return r
 
 
+def vol_direction(r, a):
+    """اتجاه الفوليوم على شموع الدقيقة داخل فترة التنبيه: الفوليوم لازم أغلبه على شموع خضرا،
+    وأكبر شمعة فوليوم فيه ما تكونش حمرا (يعني تصريف/نزول مش تجميع). السعر الصافي ممكن يطلع صفر
+    لو العملة نزلت جامد وبعدين ارتدت جوه نفس الفترة، فالحركة الصافية لوحدها مش كفاية."""
+    r["up_share"], r["sell_spike"], r["dir_ok"] = None, False, True
+    if getattr(a, "min_up", 0) <= 0:
+        return r
+    m = max(int(r["mins"]), 3)
+    raw = api_get("/api/v2/spot/market/candles", {"symbol": r["symbol"], "granularity": "1min", "limit": str(min(m + 3, 200))})
+    if not raw or len(raw) < 3:
+        return r  # مفيش بيانات كفاية: منحكمش
+    rows = sorted(raw, key=lambda c: int(c[0]))[-m:]
+    up = sum(float(x[6]) for x in rows if float(x[4]) > float(x[1]))
+    dn = sum(float(x[6]) for x in rows if float(x[4]) < float(x[1]))
+    if up + dn > 0:
+        r["up_share"] = up / (up + dn) * 100
+    pk = max(rows, key=lambda x: float(x[6]))
+    po, pc = float(pk[1]), float(pk[4])
+    r["sell_spike"] = po > 0 and pc < po and (po - pc) / po * 100 >= 0.3
+    r["dir_ok"] = not r["sell_spike"] and (r["up_share"] is None or r["up_share"] >= a.min_up)
+    return r
+
+
+def enrich_vol(r, a):
+    r = enrich(r, a)
+    vol_direction(r, a)
+    r["strong"] = r["strong"] and r["dir_ok"]
+    return r
+
+
 def scan(a, tickers=None):
     cands = get_candidates(a, tickers)
     print(f"[{time.strftime('%H:%M:%S')}] عملات بعد الفلترة الأولية: {len(cands)}")
@@ -212,7 +250,7 @@ def scan(a, tickers=None):
                 results.append(res)
     if results:
         with ThreadPoolExecutor(max_workers=a.workers) as ex:
-            results = list(ex.map(lambda r: enrich(r, a), results))
+            results = list(ex.map(lambda r: enrich_vol(r, a), results))
     if not a.weak:
         results = [r for r in results if r["strong"]]
     results.sort(key=lambda r: (r["strong"], r["ratio"]), reverse=True)
@@ -268,7 +306,9 @@ def format_alert(r, a):
             f"{tag}  {r['symbol']}  |  {kind}",
             f"الفوليوم في آخر {r['mins']} دقيقة: ${r['recent_usd']:,.0f} (الطبيعي لنفس المدة ${r['baseline_per_candle'] * r['k']:,.0f}) x{r['ratio']:.1f}",
             f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}",
-            f"آخر {r['trades']} صفقة: شراء ${r['buy_usd']:,.0f} مقابل بيع ${r['sell_usd']:,.0f}",
+            f"آخر {r['trades']} صفقة" + (f" (بتغطي آخر {r['fills_min']:.0f} دقيقة)" if r.get("fills_min") is not None else "") + f": شراء ${r['buy_usd']:,.0f} مقابل بيع ${r['sell_usd']:,.0f}",
+            *([f"اتجاه الفوليوم (شموع الدقيقة): {r['up_share']:.0f}% منه على شموع خضرا"] if r.get("up_share") is not None else []),
+            *(["⚠️ عينة الصفقات أقصر من فترة الفوليوم، فنسبة الشراء مش للفترة كلها"] if r.get("fills_min") is not None and r["fills_min"] < r["mins"] * 0.5 else []),
             reasons,
             f"https://www.bitget.com/spot/{r['symbol']}",
         ]
@@ -535,6 +575,9 @@ def debug_coin(sym, a, tickers, now):
                     bad.append(f"السبريد {r['spread']:.2f}% أكبر من {a.max_spread:g}%")
                 if r["botlike"]:
                     bad.append("شبهة بوت")
+                vd = vol_direction({"symbol": sym, "mins": ok_any * a.tfm}, a)
+                if getattr(a, "min_up", 0) > 0:
+                    print(f"[DEBUG {sym}] [اتجاه الفوليوم] خضرا {vd['up_share'] if vd['up_share'] is None else round(vd['up_share'])}% | أكبر شمعة فوليوم حمرا: {'أيوه' if vd['sell_spike'] else 'لا'} -> {'✅' if vd['dir_ok'] else '❌ هيتلغي (نزول مش تجميع)'}")
                 print(f"[DEBUG {sym}] [تأكيد] {r['trades']} صفقة: شراء {r['buy_pct']:.0f}% (${r['buy_usd']:,.0f})، أوردر بوك {r['book_pct']:.0f}%، سبريد {r['spread']:.2f}% -> {'✅ قوية' if not bad else '❌ ' + '، '.join(bad)}")
     if not a.no_pump:
         if vol24 < a.pump_min_vol24:
@@ -749,6 +792,7 @@ def main():
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
     p.add_argument("--min-buy", type=float, default=60, help="أقل نسبة شراء عدواني %%")
     p.add_argument("--fills", type=int, default=300, help="عدد آخر الصفقات اللي بنحسب منها نسبة الشراء (حد أقصى 500)")
+    p.add_argument("--min-up", type=float, default=55, help="تنبيه الفوليوم: أقل نسبة%% من الفوليوم لازم تكون على شموع دقيقة خضرا (وأكبر شمعة فوليوم مش حمرا). 0 = إيقاف")
     p.add_argument("--min-buy-usd", type=float, default=500, help="أقل قيمة $ لصفقات الشراء العدواني في العينة")
     p.add_argument("--pump-min-buy", type=float, default=50, help="تنبيه الصعود يتلغي لو نسبة الشراء أقل من كده%%")
     p.add_argument("--min-book", type=float, default=52, help="أقل نسبة سيولة bid في الأوردر بوك %%")
