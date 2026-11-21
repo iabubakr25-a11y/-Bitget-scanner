@@ -116,8 +116,12 @@ def analyze(item, a):
         active = sum(1 for r in recent if float(r[6]) > 2 * baseline)
         # فلتر الاتجاه: مش عايزين فوليوم مع سعر نازل أو راجع لتحت إغلاق الشمعة اللي قبلها
         trend_ok = a.no_trend or (move >= a.min_move and c >= float(rows[-2][4]) * (1 - a.trend_tol / 100))
+        hid = abs(move) <= a.h_move and rng <= a.h_range and abs(chg24) <= a.h_24
+        # لو مش "مخفي" (يعني السعر مش هادي) لازم السعر يكون فعلاً طلع vis_min_move%% على الأقل
+        vis_ok = hid or move >= a.vis_min_move
         if (
             trend_ok
+            and vis_ok
             and ratio >= a.ratio
             and total >= a.min_usd
             and abs(move) <= a.max_move
@@ -141,7 +145,7 @@ def analyze(item, a):
                 "vol_rate": total / mins * 60,  # معدل الفوليوم في الساعة
                 "vol24": vol24,
                 "chg24": chg24,
-                "hidden": abs(move) <= a.h_move and rng <= a.h_range and abs(chg24) <= a.h_24,
+                "hidden": hid,
             }
     return best
 
@@ -498,6 +502,9 @@ def debug_coin(sym, a, tickers, now):
                     fails.append(f"الحركة {mv:+.1f}% أقل من {a.min_move:g}")
                 if not a.no_trend and c < float(rows[-2][4]) * (1 - a.trend_tol / 100):
                     fails.append("السعر تحت إغلاق الشمعة اللي قبلها")
+                hid = abs(mv) <= a.h_move and (max(float(r[2]) for r in rec) / min(float(r[3]) for r in rec) - 1) * 100 <= a.h_range and abs(chg24) <= a.h_24
+                if not hid and mv < a.vis_min_move:
+                    fails.append(f"مش مخفي (السعر مش هادي) والحركة {mv:+.1f}% أقل من {a.vis_min_move:g}%")
                 print(f"[DEBUG {sym}] [فوليوم] نافذة {k * a.tfm} دقيقة: x{ratio:.1f}، ${tot:,.0f}، حركة {mv:+.1f}% -> {'✅ عدّت' if not fails else '❌ ' + '، '.join(fails)}")
                 if not fails and ok_any is None:
                     ok_any = k
@@ -709,6 +716,7 @@ def main():
     p.add_argument("--min-usd", type=float, default=1000, help="أقل حجم $ في الفترة الحديثة")
     p.add_argument("--min-move", type=float, default=-0.3, help="أقل حركة سعر%% مسموحة في الفترة (فلتر الاتجاه، يمنع الفوليوم مع نزول)")
     p.add_argument("--trend-tol", type=float, default=0.3, help="السعر الحالي لازم ميبقاش تحت إغلاق الشمعة اللي قبل كده بأكتر من %%")
+    p.add_argument("--vis-min-move", type=float, default=5.0, help="التنبيه الظاهر (السعر مش هادي): أقل حركة سعر%% في الفترة عشان يتبعت (التنبيه المخفي مش متأثر)")
     p.add_argument("--no-trend", action="store_true", help="إيقاف فلتر الاتجاه")
     p.add_argument("--max-move", type=float, default=2.0, help="أقصى حركة سعر%% في الفترة")
     p.add_argument("--max-range", type=float, default=4.0, help="أقصى مدى high-low%% في الفترة")
