@@ -114,8 +114,11 @@ def analyze(item, a):
         rng = (hi / lo - 1) * 100
         # عدد الشموع النشطة (حجم أكبر من ضعف الطبيعي)
         active = sum(1 for r in recent if float(r[6]) > 2 * baseline)
+        # فلتر الاتجاه: مش عايزين فوليوم مع سعر نازل أو راجع لتحت إغلاق الشمعة اللي قبلها
+        trend_ok = a.no_trend or (move >= a.min_move and c >= float(rows[-2][4]) * (1 - a.trend_tol / 100))
         if (
-            ratio >= a.ratio
+            trend_ok
+            and ratio >= a.ratio
             and total >= a.min_usd
             and abs(move) <= a.max_move
             and rng <= a.max_range
@@ -146,7 +149,7 @@ def analyze(item, a):
 def enrich(r, a):
     """مرحلة التأكيد: اتجاه الشراء العدواني + عمق الأوردر بوك + فحص البوتات."""
     sym = r["symbol"]
-    fills = api_get("/api/v2/spot/market/fills", {"symbol": sym, "limit": "100"}) or []
+    fills = api_get("/api/v2/spot/market/fills", {"symbol": sym, "limit": str(a.fills)}) or []
     buy = sell = 0.0
     sizes = []
     for f in fills:
@@ -187,6 +190,7 @@ def enrich(r, a):
 
     r["strong"] = (
         r["buy_pct"] >= a.min_buy
+        and r["buy_usd"] >= a.min_buy_usd
         and r["book_pct"] >= a.min_book
         and r["spread"] <= a.max_spread
         and not r["botlike"]
@@ -521,6 +525,9 @@ def main():
     p.add_argument("--windows", default="1,3,6,12", help="مدد القياس بعدد الشموع (مع 5min: 5 و15 و30 و60 دقيقة)")
     p.add_argument("--ratio", type=float, default=4.0, help="أقل نسبة قفزة حجم عن الطبيعي")
     p.add_argument("--min-usd", type=float, default=1000, help="أقل حجم $ في الفترة الحديثة")
+    p.add_argument("--min-move", type=float, default=-0.3, help="أقل حركة سعر%% مسموحة في الفترة (فلتر الاتجاه، يمنع الفوليوم مع نزول)")
+    p.add_argument("--trend-tol", type=float, default=0.3, help="السعر الحالي لازم ميبقاش تحت إغلاق الشمعة اللي قبل كده بأكتر من %%")
+    p.add_argument("--no-trend", action="store_true", help="إيقاف فلتر الاتجاه")
     p.add_argument("--max-move", type=float, default=2.0, help="أقصى حركة سعر%% في الفترة")
     p.add_argument("--max-range", type=float, default=4.0, help="أقصى مدى high-low%% في الفترة")
     p.add_argument("--min-active", type=int, default=1, help="أقل عدد شموع نشطة")
@@ -535,7 +542,10 @@ def main():
     p.add_argument("--cooldown", type=int, default=900, help="ثواني قبل تكرار تنبيه نفس العملة لو الفوليوم لسه عالي")
     p.add_argument("--vol-step", type=float, default=1.5, help="يكرر التنبيه فوراً لو الفوليوم الحديث زاد بالمعامل ده عن آخر تنبيه")
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
-    p.add_argument("--min-buy", type=float, default=58, help="أقل نسبة شراء عدواني %%")
+    p.add_argument("--min-buy", type=float, default=60, help="أقل نسبة شراء عدواني %%")
+    p.add_argument("--fills", type=int, default=300, help="عدد آخر الصفقات اللي بنحسب منها نسبة الشراء (حد أقصى 500)")
+    p.add_argument("--min-buy-usd", type=float, default=500, help="أقل قيمة $ لصفقات الشراء العدواني في العينة")
+    p.add_argument("--pump-min-buy", type=float, default=50, help="تنبيه الصعود يتلغي لو نسبة الشراء أقل من كده%%")
     p.add_argument("--min-book", type=float, default=52, help="أقل نسبة سيولة bid في الأوردر بوك %%")
     p.add_argument("--max-spread", type=float, default=1.5, help="أقصى سبريد bid/ask %%")
     p.add_argument("--depth", type=float, default=2.0, help="عمق الأوردر بوك المحسوب حوالين السعر %%")
@@ -606,6 +616,11 @@ def main():
                 if skipped:
                     print("تجاهل (مفيش بيانات تداول):", ", ".join(skipped))
                 pumps = [r for r in pumps if r["trades"] or r["bid_usd"] or r["ask_usd"]]
+                # الصعود لازم الشراء فيه مش أقل من pump_min_buy% (لو عندنا صفقات نحكم بيها)
+                weak_buy = [r["symbol"] for r in pumps if r["trades"] and r["buy_pct"] < a.pump_min_buy]
+                if weak_buy:
+                    print("تجاهل (البيع غالب):", ", ".join(weak_buy))
+                pumps = [r for r in pumps if not r["trades"] or r["buy_pct"] >= a.pump_min_buy]
             if pumps:
                 notify(
                     "\n\n".join(format_pump(r) for r in pumps[:8]),
