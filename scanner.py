@@ -307,18 +307,26 @@ def candle_pump(sym, a, now):
     if not (big or three):
         return None
     why = f"شمعة {m} دقايق أقفلت +{gain:.1f}%" if big else "3 شموع خضرا متتالية بإغلاق أعلى"
-    return {"price": c, "rise": rise, "mins": (int(last[0]) - low_ts) / 60000 + m, "why": why}
+    return {
+        "price": c,
+        "rise": rise,
+        "mins": (int(last[0]) - low_ts) / 60000 + m,
+        "why": why,
+        "closed_at": int(last[0]) / 1000 + m * 60,  # وقت إقفال الشمعة
+    }
 
 
 def track_pumps(tickers, a, state, now):
-    """تتبع الصعود: عملة صعدت pump_pct% وشمعة الـ5 دقايق أقفلت فوق الشمعة اللي قبلها.
-    وتتكرر نفس العملة كل ما تكمل صعود pump_step% فوق سعر آخر تنبيه."""
+    """تتبع الصعود: لما شمعة صعود حقيقية تتقفل (candle_pump) مش بنبعت فوراً،
+    بنستنى confirm_sec ثانية ونتأكد إن السعر لسه ماسك (مش نزل أكتر من hold_pct%% عن إغلاق الشمعة).
+    وتتكرر نفس العملة كل ما تكمل صعود pump_step%% فوق سعر آخر تنبيه."""
     if not tickers:
         return []
     hist = state.setdefault("hist", {})
     last = state.setdefault("pump", {})
+    pend = state.setdefault("pend", {})
     window = a.pump_window * 60
-    cands, live = [], set()
+    cands, live, prices = [], set(), {}
     for t in tickers:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT") or sym in a.excl:
@@ -331,6 +339,7 @@ def track_pumps(tickers, a, state, now):
             continue
         if price <= 0:
             continue
+        prices[sym] = (price, vol24, chg24)
         if vol24 < a.pump_min_vol24:
             continue
         live.add(sym)
@@ -343,10 +352,9 @@ def track_pumps(tickers, a, state, now):
         # فلتر أولي رخيص عشان منطلبش شموع لكل العملات
         if hist_rise >= min(a.pump_pct, a.big_candle) * 0.5 or sym in last:
             cands.append((sym, vol24, chg24, price))
-    for s in list(hist):
-        if s not in live:
-            del hist[s]
-    out = []
+    for s_ in list(hist):
+        if s_ not in live:
+            del hist[s_]
     if cands:
         with ThreadPoolExecutor(max_workers=a.workers) as ex:
             res = list(ex.map(lambda it: candle_pump(it[0], a, now), cands))
@@ -359,21 +367,42 @@ def track_pumps(tickers, a, state, now):
                 r
                 and (ref is None or r["price"] >= ref["price"] * (1 + a.pump_step / 100))
                 and (ref is None or now - ref["ts"] >= a.pump_gap)
+                and now - r["closed_at"] <= a.pump_max_age  # الشمعة لسه طازة، مش قديمة
             ):
-                out.append(
-                    {
-                        "symbol": sym,
-                        "price": r["price"],
-                        "rise": r["rise"],
-                        "mins": r["mins"],
-                        "why": r["why"],
-                        "vol24": vol24,
-                        "chg24": chg24,
-                        "repeat": ref is not None,
-                        "from_alert": ref["price"] if ref else None,
-                    }
-                )
-                last[sym] = {"price": r["price"], "ts": now}
+                p = pend.get(sym)
+                if not p or abs(p["r"]["price"] - r["price"]) > 1e-12:
+                    pend[sym] = {"t": now, "r": r, "chg24": chg24, "vol24": vol24}
+    out = []
+    for sym, p in list(pend.items()):
+        cur = prices.get(sym)
+        r = p["r"]
+        if cur is None or now - p["t"] > 900:
+            pend.pop(sym, None)
+            continue
+        price_now = cur[0]
+        if price_now < r["price"] * (1 - a.hold_pct / 100):
+            print(f"تجاهل {sym}: السعر رجع تحت إغلاق شمعة الصعود (انعكاس)")
+            pend.pop(sym, None)
+            continue
+        if now - p["t"] < a.confirm_sec:
+            continue
+        ref = last.get(sym)
+        out.append(
+            {
+                "symbol": sym,
+                "price": r["price"],
+                "now_price": price_now,
+                "rise": r["rise"],
+                "mins": r["mins"],
+                "why": r["why"],
+                "vol24": p["vol24"],
+                "chg24": p["chg24"],
+                "repeat": ref is not None,
+                "from_alert": ref["price"] if ref else None,
+            }
+        )
+        last[sym] = {"price": r["price"], "ts": now}
+        pend.pop(sym, None)
     out.sort(key=lambda r: r["rise"], reverse=True)
     return out
 
@@ -382,7 +411,8 @@ def format_pump(r):
     head = "🚀 كمّلت صعود" if r["repeat"] else "🚀 صعود جديد"
     lines = [
         f"{head}  {r['symbol']}",
-        f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  السعر: {fmt_price(r['price'])}",
+        f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  إغلاق الشمعة: {fmt_price(r['price'])}",
+        f"السعر دلوقتي: {fmt_price(r['now_price'])} ({(r['now_price'] / r['price'] - 1) * 100:+.1f}% عن الإغلاق)",
         f"✅ {r['why']}",
     ]
     if r["repeat"]:
@@ -517,6 +547,9 @@ def main():
     p.add_argument("--big-candle", type=float, default=3.0, help="شمعة وحدة مقفولة زادت كده%% = صعود لحظي")
     p.add_argument("--pump-min-candle-usd", type=float, default=300, help="أقل فوليوم $ لشمعة الصعود (يمنع الصعود الوهمي على صفقة واحدة)")
     p.add_argument("--max-wick", type=float, default=0.4, help="أقصى نسبة للفتيلة العلوية من الشمعة (أكتر منها = ارتداد/فخ)")
+    p.add_argument("--confirm-sec", type=int, default=40, help="استنى كام ثانية بعد إقفال شمعة الصعود وتأكد إن السعر ماسك قبل ما تبعت")
+    p.add_argument("--hold-pct", type=float, default=0.7, help="لو السعر نزل أكتر من كده%% عن إغلاق شمعة الصعود، التنبيه بيتلغي (انعكاس)")
+    p.add_argument("--pump-max-age", type=int, default=240, help="أقصى عمر بالثواني لشمعة الصعود (أقدم من كده تتجاهل)")
     p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
     p.add_argument("--exclude", default="RBRAIUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
