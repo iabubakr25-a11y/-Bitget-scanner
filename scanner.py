@@ -373,7 +373,7 @@ def track_pumps(tickers, a, state, now):
         low = min(min(p[1] for p in h), price)
         hist_rise = (price / low - 1) * 100
         # فلتر أولي رخيص عشان منطلبش شموع لكل العملات
-        if hist_rise >= min(a.pump_pct, a.big_candle) * 0.5 or sym in last:
+        if hist_rise >= a.pump_pct * 0.5 or sym in last:  # التنبيه النهائي محتاج صعود pump_pct%% على الأقل
             cands.append((sym, vol24, chg24, price))
     for s_ in list(hist):
         if s_ not in live:
@@ -731,6 +731,7 @@ def main():
     p.add_argument("--duration", type=int, default=0, help="مع --loop: أقصى مدة تشغيل بالثواني قبل ما يقفل لوحده (0 = بلا حد)")
     p.add_argument("--cooldown", type=int, default=900, help="ثواني قبل تكرار تنبيه نفس العملة لو الفوليوم لسه عالي")
     p.add_argument("--vol-step", type=float, default=1.5, help="يكرر التنبيه فوراً لو الفوليوم الحديث زاد بالمعامل ده عن آخر تنبيه")
+    p.add_argument("--vol-price-step", type=float, default=3.0, help="يكرر تنبيه الفوليوم لو السعر كمل صعود كده%% فوق سعر آخر تنبيه (0 = إيقاف)")
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
     p.add_argument("--min-buy", type=float, default=60, help="أقل نسبة شراء عدواني %%")
     p.add_argument("--fills", type=int, default=300, help="عدد آخر الصفقات اللي بنحسب منها نسبة الشراء (حد أقصى 500)")
@@ -805,14 +806,19 @@ def main():
             prev = seen.get(r["symbol"])
             if prev is None:
                 fresh.append(r)
-            elif now - prev["ts"] >= a.cooldown or r["vol_rate"] >= prev["vol"] * a.vol_step:
+            elif (
+                now - prev["ts"] >= a.cooldown
+                or r["vol_rate"] >= prev["vol"] * a.vol_step
+                # تكرار لو السعر كمل صعود vol_price_step%% فوق سعر آخر تنبيه (والفوليوم لسه عالي)
+                or (a.vol_price_step > 0 and prev.get("price") and now - prev["ts"] >= 120 and r["price"] >= prev["price"] * (1 + a.vol_price_step / 100))
+            ):
                 r["repeat"] = True
                 fresh.append(r)
         if fresh:
             blocks = []
             for r in fresh[:10]:
                 blocks.append(format_alert(r, a))
-                seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"]}
+                seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"], "price": r["price"]}
             notify("\n\n".join(blocks))
             log_alerts(st, [(r["symbol"], "vol-hidden" if r["hidden"] else "vol-visible", r["price"]) for r in fresh[:10]], now)
         if not a.no_pump:
