@@ -308,24 +308,9 @@ def candle_pump(sym, a, now):
         and sum(float(x[6]) for x in r3) >= a.pump_min_candle_usd
         and wick_ok
     )
-    # ارتداد: العملة نزلت نزول حقيقي (rebound_drop%) لقاع حديث، وبعدها طلعت من القاع rebound_pct% أو أكتر
-    rebound, rb_txt = False, ""
-    if not a.no_rebound:
-        lo_v, lo_i = min((float(x[3]), i) for i, x in enumerate(rows))
-        if lo_v > 0 and lo_i >= 1 and len(rows) - 1 - lo_i <= a.rebound_candles:
-            top = max(float(x[2]) for x in rows[:lo_i])
-            drop = (top / lo_v - 1) * 100
-            rb = (c / lo_v - 1) * 100
-            vol_since = sum(float(x[6]) for x in rows[lo_i:])
-            if drop >= a.rebound_drop and rb >= a.rebound_pct and c > o and vol_since >= a.pump_min_candle_usd and wick_ok:
-                rebound = True
-                rb_txt = f"ارتداد من القاع {fmt_price(lo_v)} (نزلت {drop:.1f}% قبلها وطلعت {rb:.1f}% من القاع)"
-    if not (big or three or rebound):
+    if not (big or three):
         return None
-    if rebound:
-        why = rb_txt
-    else:
-        why = f"شمعة {m} دقايق أقفلت +{gain:.1f}%" if big else "3 شموع خضرا متتالية بإغلاق أعلى"
+    why = f"شمعة {m} دقايق أقفلت +{gain:.1f}%" if big else "3 شموع خضرا متتالية بإغلاق أعلى"
     return {
         "price": c,
         "rise": rise,
@@ -384,7 +369,6 @@ def track_pumps(tickers, a, state, now):
                 ref = None
             if (
                 r
-                and r["rise"] >= a.pump_pct  # الصعود لازم يكون pump_pct%% على الأقل (5%% افتراضياً)
                 and (ref is None or r["price"] >= ref["price"] * (1 + a.pump_step / 100))
                 and (ref is None or now - ref["ts"] >= a.pump_gap)
                 and now - r["closed_at"] <= a.pump_max_age  # الشمعة لسه طازة، مش قديمة
@@ -428,12 +412,7 @@ def track_pumps(tickers, a, state, now):
 
 
 def format_pump(r):
-    if r["repeat"]:
-        head = "🚀 كمّلت صعود"
-    elif r["why"].startswith("ارتداد"):
-        head = "🔄 ارتداد بعد نزول"
-    else:
-        head = "🚀 صعود جديد"
+    head = "🚀 كمّلت صعود" if r["repeat"] else "🚀 صعود جديد"
     lines = [
         f"{head}  {r['symbol']}",
         f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  إغلاق الشمعة: {fmt_price(r['price'])}",
@@ -452,167 +431,6 @@ def format_pump(r):
             lines.append("⚠️ طلبات البيع أكتر من الشراء، احتمال تصريف")
     lines.append("⚠️ الصعود حصل بالفعل، اتأكد من الشارت قبل أي قرار")
     lines.append(f"https://www.bitget.com/spot/{r['symbol']}")
-    return "\n".join(lines)
-
-
-def debug_coin(sym, a, tickers, now):
-    """تشخيص: بيطبع في اللوج ليه عملة معينة اتبعتت أو اتلغت، وعند أنهي شرط بالظبط."""
-    t = next((x for x in tickers if x.get("symbol") == sym), None)
-    if not t:
-        print(f"[DEBUG {sym}] مش موجودة في التيكرز")
-        return
-    try:
-        price = float(t.get("lastPr") or t.get("close") or 0)
-        vol24 = float(t.get("usdtVolume") or t.get("quoteVolume") or 0)
-        chg24 = float(t.get("change24h") or 0) * 100
-    except ValueError:
-        return
-    print(f"[DEBUG {sym}] السعر {fmt_price(price)} | فوليوم 24س ${vol24:,.0f} | تغير 24س {chg24:+.1f}%")
-    if sym in a.excl:
-        print(f"[DEBUG {sym}] ❌ مستبعدة بـ --exclude")
-        return
-    if not a.no_vol:
-        if not (a.min_vol24 <= vol24 <= a.max_vol24):
-            print(f"[DEBUG {sym}] ❌ فوليوم 24س خارج الحدود ({a.min_vol24:,.0f} - {a.max_vol24:,.0f})")
-        raw = api_get("/api/v2/spot/market/candles", {"symbol": sym, "granularity": a.tf, "limit": "200"})
-        kmax = max(a.wins)
-        if not raw or len(raw) < kmax + 40:
-            print(f"[DEBUG {sym}] ❌ [فوليوم] شموع {a.tf} مش كفاية ({len(raw) if raw else 0} من {kmax + 40})")
-        else:
-            rows = sorted(raw, key=lambda c: int(c[0]))
-            bv = [float(r[6]) for r in rows[:-kmax]]
-            base = max(statistics.median(bv), statistics.mean(bv) * 0.5, a.floor)
-            ok_any = None
-            for k in a.wins:
-                rec = rows[-k:]
-                tot = sum(float(r[6]) for r in rec)
-                ratio = (tot / k) / base
-                o, c = float(rec[0][1]), float(rec[-1][4])
-                mv = (c / o - 1) * 100 if o > 0 else 0
-                fails = []
-                if ratio < a.ratio:
-                    fails.append(f"الفوليوم x{ratio:.1f} أقل من {a.ratio:g}")
-                if tot < a.min_usd:
-                    fails.append(f"الحجم ${tot:,.0f} أقل من ${a.min_usd:,.0f}")
-                if not a.no_trend and mv < a.min_move:
-                    fails.append(f"الحركة {mv:+.1f}% أقل من {a.min_move:g}")
-                if not a.no_trend and c < float(rows[-2][4]) * (1 - a.trend_tol / 100):
-                    fails.append("السعر تحت إغلاق الشمعة اللي قبلها")
-                print(f"[DEBUG {sym}] [فوليوم] نافذة {k * a.tfm} دقيقة: x{ratio:.1f}، ${tot:,.0f}، حركة {mv:+.1f}% -> {'✅ عدّت' if not fails else '❌ ' + '، '.join(fails)}")
-                if not fails and ok_any is None:
-                    ok_any = k
-            if ok_any is not None:
-                r = enrich({"symbol": sym}, a)
-                bad = []
-                if r["buy_pct"] < a.min_buy:
-                    bad.append(f"الشراء {r['buy_pct']:.0f}% أقل من {a.min_buy:g}%")
-                if r["buy_usd"] < a.min_buy_usd:
-                    bad.append(f"قيمة الشراء ${r['buy_usd']:,.0f} أقل من ${a.min_buy_usd:,.0f}")
-                if r["book_pct"] < a.min_book:
-                    bad.append(f"الأوردر بوك {r['book_pct']:.0f}% أقل من {a.min_book:g}%")
-                if r["spread"] > a.max_spread:
-                    bad.append(f"السبريد {r['spread']:.2f}% أكبر من {a.max_spread:g}%")
-                if r["botlike"]:
-                    bad.append("شبهة بوت")
-                print(f"[DEBUG {sym}] [تأكيد] {r['trades']} صفقة: شراء {r['buy_pct']:.0f}% (${r['buy_usd']:,.0f})، أوردر بوك {r['book_pct']:.0f}%، سبريد {r['spread']:.2f}% -> {'✅ قوية' if not bad else '❌ ' + '، '.join(bad)}")
-    if not a.no_pump:
-        if vol24 < a.pump_min_vol24:
-            print(f"[DEBUG {sym}] ❌ [صعود] فوليوم 24س أقل من ${a.pump_min_vol24:,.0f}")
-            return
-        m = a.ptfm
-        n = a.pump_window // m + 1
-        raw = api_get("/api/v2/spot/market/candles", {"symbol": sym, "granularity": a.pump_tf, "limit": str(max(n, 4) + 3)})
-        if not raw or len(raw) < 5:
-            print(f"[DEBUG {sym}] ❌ [صعود] شموع مش كفاية")
-            return
-        rows = sorted(raw, key=lambda c: int(c[0]))
-        if int(rows[-1][0]) / 1000 + m * 60 > now:
-            rows = rows[:-1]
-        last = rows[-1]
-        o, h, l, c, v = float(last[1]), float(last[2]), float(last[3]), float(last[4]), float(last[6])
-        rng = h - l
-        wick = (h - c) / rng if rng > 0 else 0
-        gain = (c / o - 1) * 100 if o > 0 else 0
-        win = rows[-n:]
-        low = min(min(float(r[1]), float(r[4])) for r in win)
-        rise = (c / low - 1) * 100 if low > 0 else 0
-        age = now - (int(last[0]) / 1000 + m * 60)
-        res = candle_pump(sym, a, now)
-        fails = []
-        if gain < a.big_candle:
-            fails.append(f"آخر شمعة {gain:+.1f}% أقل من {a.big_candle:g}%")
-        if v < a.pump_min_candle_usd:
-            fails.append(f"حجمها ${v:,.0f} أقل من ${a.pump_min_candle_usd:,.0f}")
-        if wick > a.max_wick:
-            fails.append(f"الفتيلة العلوية {wick * 100:.0f}% أكبر من {a.max_wick * 100:.0f}%")
-        print(f"[DEBUG {sym}] [صعود] آخر شمعة مقفولة: {gain:+.1f}%، حجم ${v:,.0f}، فتيلة {wick * 100:.0f}%، صعود من أدنى نقطة {rise:+.1f}%، عمرها {age:.0f}ث -> {'✅ شرط الشمعة اتحقق' if res else '❌ ' + ('، '.join(fails) or 'مفيش 3 شموع خضرا متتالية ولا ارتداد من قاع')}")
-        if res and res["rise"] < a.pump_pct:
-            print(f"[DEBUG {sym}] ❌ [صعود] الصعود {res['rise']:.1f}% أقل من {a.pump_pct:g}% (الحد الأدنى للتنبيه)")
-        elif res:
-            if age > a.pump_max_age:
-                print(f"[DEBUG {sym}] ❌ [صعود] الشمعة قديمة (أكتر من {a.pump_max_age}ث)")
-            elif price < res["price"] * (1 - a.hold_pct / 100):
-                print(f"[DEBUG {sym}] ❌ [صعود] السعر الحالي {fmt_price(price)} نزل تحت إغلاق الشمعة {fmt_price(res['price'])} بأكتر من {a.hold_pct:g}% (انعكاس)")
-            else:
-                print(f"[DEBUG {sym}] ✅ [صعود] المفروض يتبعت بعد {a.confirm_sec} ثانية تأكيد")
-
-
-def log_alerts(st, items, now):
-    """بنسجل كل تنبيه (العملة، النوع، السعر) عشان نقيس بعدها بربع ساعة وساعة نتيجته فعلاً."""
-    lg = st.setdefault("log", [])
-    for sym, kind, price in items:
-        if price and price > 0:
-            lg.append({"s": sym, "k": kind, "p": price, "t": now})
-    del lg[:-300]
-
-
-def update_log(st, tickers, now):
-    """بيسجل سعر العملة بعد 15 و60 دقيقة من التنبيه ويطبع النتيجة في اللوج."""
-    lg = st.get("log", [])
-    if not lg:
-        return
-    px = {}
-    for t in tickers:
-        try:
-            px[t.get("symbol", "")] = float(t.get("lastPr") or t.get("close") or 0)
-        except ValueError:
-            continue
-    for e in lg:
-        cur = px.get(e["s"])
-        if not cur:
-            continue
-        for m in (15, 60):
-            key = f"r{m}"
-            if key not in e and now - e["t"] >= m * 60:
-                e[key] = (cur / e["p"] - 1) * 100
-                print(f"نتيجة {e['s']} ({e['k']}): بعد {m} دقيقة {e[key]:+.1f}% عن سعر التنبيه")
-    st["log"] = [e for e in lg if now - e["t"] < 48 * 3600]
-
-
-KIND_NAMES = {
-    "pump": "🚀 صعود",
-    "rebound": "🔄 ارتداد",
-    "vol-hidden": "🕶 فوليوم مخفي",
-    "vol-visible": "📢 فوليوم ظاهر",
-}
-
-
-def summary_text(st, now):
-    """ملخص نتايج التنبيهات اللي عدّى عليها ساعة (آخر 24 ساعة)، لكل نوع تنبيه لوحده."""
-    done = [e for e in st.get("log", []) if "r60" in e and now - e["t"] < 24 * 3600]
-    if not done:
-        return None
-    lines = ["📊 ملخص نتايج التنبيهات (آخر 24 ساعة، القياس بعد ساعة من التنبيه)"]
-    for kind, name in KIND_NAMES.items():
-        g = [e for e in done if e["k"] == kind]
-        if not g:
-            continue
-        up = sum(1 for e in g if e["r60"] > 0)
-        avg60 = sum(e["r60"] for e in g) / len(g)
-        g15 = [e["r15"] for e in g if "r15" in e]
-        avg15 = f" | متوسط بعد 15 دقيقة {sum(g15) / len(g15):+.1f}%" if g15 else ""
-        lines.append(f"{name}: {len(g)} تنبيه | {up} منهم أعلى بعد ساعة | متوسط بعد ساعة {avg60:+.1f}%{avg15}")
-    lines.append("القياس لسعر التنبيه بس، مش ربح فعلي (من غير رسوم ولا انزلاق). ومش نصيحة مالية.")
     return "\n".join(lines)
 
 
@@ -739,24 +557,17 @@ def main():
     p.add_argument("--big-candle", type=float, default=3.0, help="شمعة وحدة مقفولة زادت كده%% = صعود لحظي")
     p.add_argument("--pump-min-candle-usd", type=float, default=300, help="أقل فوليوم $ لشمعة الصعود (يمنع الصعود الوهمي على صفقة واحدة)")
     p.add_argument("--max-wick", type=float, default=0.4, help="أقصى نسبة للفتيلة العلوية من الشمعة (أكتر منها = ارتداد/فخ)")
-    p.add_argument("--confirm-sec", type=int, default=30, help="استنى كام ثانية بعد إقفال شمعة الصعود وتأكد إن السعر ماسك قبل ما تبعت")
+    p.add_argument("--confirm-sec", type=int, default=40, help="استنى كام ثانية بعد إقفال شمعة الصعود وتأكد إن السعر ماسك قبل ما تبعت")
     p.add_argument("--hold-pct", type=float, default=0.7, help="لو السعر نزل أكتر من كده%% عن إغلاق شمعة الصعود، التنبيه بيتلغي (انعكاس)")
     p.add_argument("--pump-max-age", type=int, default=240, help="أقصى عمر بالثواني لشمعة الصعود (أقدم من كده تتجاهل)")
-    p.add_argument("--rebound-drop", type=float, default=4.0, help="الارتداد: أقل نزول%% قبل القاع عشان نعتبره نزول حقيقي")
-    p.add_argument("--rebound-pct", type=float, default=5.0, help="الارتداد: أقل صعود%% من القاع عشان يتبعت تنبيه")
-    p.add_argument("--rebound-candles", type=int, default=6, help="الارتداد: القاع لازم يكون حديث (آخر كام شمعة)")
-    p.add_argument("--no-rebound", action="store_true", help="إيقاف تنبيهات الارتداد")
     p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
     p.add_argument("--exclude", default="RBRAIUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
-    p.add_argument("--debug", default="", help="عملات للتشخيص (مفصولة بفاصلة): يطبع في اللوج ليه اتبعتت أو اتلغت. ممكن كمان تتكتب في ملف debug.txt")
-    p.add_argument("--summary-hours", type=float, default=6.0, help="كل كام ساعة يبعتلك ملخص نتايج التنبيهات (0 = إيقاف)")
     p.add_argument("--no-vol", action="store_true", help="إيقاف فحص الفوليوم (يبقى تتبع الصعود بس، أسرع)")
     p.add_argument("--no-pump", action="store_true", help="إيقاف تتبع الصعود")
     p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
     a = p.parse_args()
     a.excl = {x.strip().upper() for x in a.exclude.split(",") if x.strip()}
-    dbg_syms = [x.strip().upper() for x in a.debug.split(",") if x.strip()]
     a.tfm = tf_minutes(a.tf)
     a.ptfm = tf_minutes(a.pump_tf)
     a.wins = sorted({int(x) for x in a.windows.split(",") if x.strip()})
@@ -774,24 +585,12 @@ def main():
             st["seen"][k] = {"ts": v, "vol": 0}
     seen = st["seen"]
     start = time.time()
-    try:  # عملات التشخيص ممكن تتحط كمان في ملف debug.txt (سطر أو فاصلة بين كل عملة)
-        with open("debug.txt", encoding="utf-8") as f:
-            dbg_syms += [x.strip().upper() for x in f.read().replace(",", "\n").split() if x.strip()]
-    except Exception:
-        pass
-    dbg_syms = list(dict.fromkeys(dbg_syms))[:8]
     while True:
         tickers = api_get("/api/v2/spot/market/tickers") or []
         results = [] if a.no_vol else scan(a, tickers)
         if not a.no_vol:
             print_table(results, a)
         now = time.time()
-        update_log(st, tickers, now)
-        for ds in dbg_syms:
-            try:
-                debug_coin(ds, a, tickers, now)
-            except Exception as e:
-                print(f"[DEBUG {ds}] خطأ: {e}")
         fresh = []
         for r in results:
             prev = seen.get(r["symbol"])
@@ -806,7 +605,6 @@ def main():
                 blocks.append(format_alert(r, a))
                 seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"]}
             notify("\n\n".join(blocks))
-            log_alerts(st, [(r["symbol"], "vol-hidden" if r["hidden"] else "vol-visible", r["price"]) for r in fresh[:10]], now)
         if not a.no_pump:
             pumps = track_pumps(tickers, a, st, now)
             print(f"تتبع الصعود: {len(pumps)} عملة صعدت {a.pump_pct:g}%+")
@@ -830,15 +628,6 @@ def main():
                     title="Bitget pump",
                     tags="rocket",
                 )
-                log_alerts(st, [(r["symbol"], "rebound" if r["why"].startswith("ارتداد") else "pump", r["now_price"]) for r in pumps[:8]], now)
-        if a.summary_hours > 0:
-            if "sum_t" not in st:
-                st["sum_t"] = now
-            elif now - st["sum_t"] >= a.summary_hours * 3600:
-                txt = summary_text(st, now)
-                if txt:
-                    notify(txt, subject="Bitget scanner: ملخص النتايج", title="Bitget summary", tags="bar_chart")
-                st["sum_t"] = now
         seen = {k: v for k, v in seen.items() if now - v["ts"] < 86400}
         st["seen"] = seen
         save_state(a.state, st)
