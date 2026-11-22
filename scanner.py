@@ -890,7 +890,7 @@ def main():
     p.add_argument("--reclaim", type=float, default=0.5, help="الارتداد: الإغلاق لازم يغطي كده (0-1) من جسم أكبر شمعة نزول قبل القاع (0.5 = النص، 0 = إيقاف الشرط)")
     p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
-    p.add_argument("--exclude", default="RBRAIUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
+    p.add_argument("--exclude", default="RBRAIUSDT,RKLMNUSDT,RDISUSDT,RSONYUSDT,RKOUSDT,RMCDUSDT,RPYPLUSDT,RNASAUSDT,RBMNRUSDT,RROKUUSDT,RLCIDUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
     p.add_argument("--debug", default="", help="عملات للتشخيص (مفصولة بفاصلة): يطبع في اللوج ليه اتبعتت أو اتلغت. ممكن كمان تتكتب في ملف debug.txt")
     p.add_argument("--summary-hours", type=float, default=6.0, help="كل كام ساعة يبعتلك ملخص نتايج التنبيهات (0 = إيقاف)")
     p.add_argument("--no-vol", action="store_true", help="إيقاف فحص الفوليوم (يبقى تتبع الصعود بس، أسرع)")
