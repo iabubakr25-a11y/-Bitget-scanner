@@ -513,6 +513,73 @@ def format_pump(r):
     return "\n".join(lines)
 
 
+def daily_check(sym, vol24, chg24, a):
+    """فحص يومي: فوليوم آخر 24 ساعة بالدولار مقارنة بمتوسط آخر daily_days يوم مقفول،
+    والسعر هادي (مش طالع ولا نازل جامد) خلال 24 ساعة وخلال الأسبوع. بيرجّع (نتيجة أو None، وصف، أسباب الرفض)."""
+    raw = api_get("/api/v2/spot/market/candles", {"symbol": sym, "granularity": "1day", "limit": str(a.daily_days + 3)})
+    if not raw or len(raw) < 6:
+        return None, "شموع يومية مش كفاية", ["شموع يومية مش كفاية"]
+    rows = sorted(raw, key=lambda c: int(c[0]))
+    done = rows[:-1][-a.daily_days:]  # آخر شمعة يومية لسه بتتكون، نشيلها
+    if len(done) < 5:
+        return None, "تاريخ قصير", [f"تاريخ قصير ({len(done)} أيام)"]
+    avg = statistics.mean(float(x[6]) for x in done)
+    ratio = vol24 / max(avg, 20_000)
+    o_old, c_now = float(done[0][1]), float(rows[-1][4])
+    week = (c_now / o_old - 1) * 100 if o_old > 0 else 0.0
+    info = f"فوليوم 24س ${vol24:,.0f} مقابل متوسط {len(done)} أيام ${avg:,.0f} (x{ratio:.1f}) | حركة 24س {chg24:+.1f}% | حركة الأسبوع {week:+.1f}%"
+    fails = []
+    if vol24 < a.daily_min_usd:
+        fails.append(f"الفوليوم ${vol24:,.0f} أقل من ${a.daily_min_usd:,.0f}")
+    if ratio < a.daily_ratio:
+        fails.append(f"x{ratio:.1f} أقل من {a.daily_ratio:g}")
+    if abs(chg24) > a.daily_move:
+        fails.append(f"حركة 24س {chg24:+.1f}% أكبر من ±{a.daily_move:g}%")
+    if abs(week) > a.daily_week:
+        fails.append(f"حركة الأسبوع {week:+.1f}% أكبر من ±{a.daily_week:g}%")
+    if fails:
+        return None, info, fails
+    return {"symbol": sym, "vol24": vol24, "avg": avg, "ratio": ratio, "chg24": chg24, "week": week, "price": c_now, "days": len(done)}, info, []
+
+
+def daily_watch(tickers, a, st, now):
+    """تنبيه 'هدوء قبل العاصفة': فوليوم يومي أعلى بكتير من الطبيعي والسعر ماتحركش. مرة واحدة كل 24 ساعة لكل عملة."""
+    seen = st.setdefault("daily", {})
+    for k in [k for k, v in seen.items() if now - v > 86400]:
+        del seen[k]
+    cands = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT") or sym in a.excl or sym in seen:
+            continue
+        try:
+            vol24 = float(t.get("usdtVolume") or t.get("quoteVolume") or 0)
+            chg24 = float(t.get("change24h") or 0) * 100
+        except ValueError:
+            continue
+        if vol24 >= a.daily_min_usd and abs(chg24) <= a.daily_move:  # فلتر رخيص قبل طلب الشموع اليومية
+            cands.append((sym, vol24, chg24))
+    out = []
+    if cands:
+        with ThreadPoolExecutor(max_workers=a.workers) as ex:
+            res = list(ex.map(lambda it: daily_check(it[0], it[1], it[2], a)[0], cands))
+        out = [r for r in res if r]
+    out.sort(key=lambda r: r["ratio"], reverse=True)
+    return out
+
+
+def format_daily(r):
+    return "\n".join(
+        [
+            f"👀 فوليوم يومي غير عادي بدون حركة سعر  {r['symbol']}",
+            f"فوليوم آخر 24 ساعة: ${r['vol24']:,.0f} (متوسط آخر {r['days']} أيام ${r['avg']:,.0f}) x{r['ratio']:.1f}",
+            f"حركة السعر: 24 ساعة {r['chg24']:+.1f}% | الأسبوع {r['week']:+.1f}%  |  السعر: {fmt_price(r['price'])}",
+            "ممكن يكون هدوء قبل حركة، وممكن تجميع أو تداول وهمي أو تصريف: مفيش طريقة تأكد من هنا",
+            f"https://www.bitget.com/spot/{r['symbol']}",
+        ]
+    )
+
+
 def debug_coin(sym, a, tickers, now):
     """تشخيص: بيطبع في اللوج ليه عملة معينة اتبعتت أو اتلغت، وعند أنهي شرط بالظبط."""
     t = next((x for x in tickers if x.get("symbol") == sym), None)
@@ -529,6 +596,9 @@ def debug_coin(sym, a, tickers, now):
     if sym in a.excl:
         print(f"[DEBUG {sym}] ❌ مستبعدة بـ --exclude")
         return
+    if not a.no_vol and not getattr(a, "no_daily", True):
+        _, info, fl = daily_check(sym, vol24, chg24, a)
+        print(f"[DEBUG {sym}] [فحص يومي] {info} -> {'✅ عدّت' if not fl else '❌ ' + '، '.join(fl)}")
     if not a.no_vol:
         if not (a.min_vol24 <= vol24 <= a.max_vol24):
             print(f"[DEBUG {sym}] ❌ فوليوم 24س خارج الحدود ({a.min_vol24:,.0f} - {a.max_vol24:,.0f})")
@@ -631,7 +701,7 @@ def log_alerts(st, items, now):
 
 
 def update_log(st, tickers, now):
-    """بيسجل سعر العملة بعد 15 و60 دقيقة من التنبيه ويطبع النتيجة في اللوج."""
+    """بيسجل سعر العملة بعد 15 و60 دقيقة (و6 ساعات ويوم) من التنبيه ويطبع النتيجة في اللوج."""
     lg = st.get("log", [])
     if not lg:
         return
@@ -645,12 +715,12 @@ def update_log(st, tickers, now):
         cur = px.get(e["s"])
         if not cur:
             continue
-        for m in (15, 60):
+        for m in (15, 60, 360, 1440):
             key = f"r{m}"
             if key not in e and now - e["t"] >= m * 60:
                 e[key] = (cur / e["p"] - 1) * 100
                 print(f"نتيجة {e['s']} ({e['k']}): بعد {m} دقيقة {e[key]:+.1f}% عن سعر التنبيه")
-    st["log"] = [e for e in lg if now - e["t"] < 48 * 3600]
+    st["log"] = [e for e in lg if now - e["t"] < 72 * 3600]
 
 
 KIND_NAMES = {
@@ -663,8 +733,9 @@ KIND_NAMES = {
 
 def summary_text(st, now):
     """ملخص نتايج التنبيهات اللي عدّى عليها ساعة (آخر 24 ساعة)، لكل نوع تنبيه لوحده."""
-    done = [e for e in st.get("log", []) if "r60" in e and now - e["t"] < 24 * 3600]
-    if not done:
+    done = [e for e in st.get("log", []) if "r60" in e and now - e["t"] < 24 * 3600 and e["k"] != "daily"]
+    dd = [e for e in st.get("log", []) if e["k"] == "daily" and "r1440" in e and now - e["t"] < 72 * 3600]
+    if not done and not dd:
         return None
     lines = ["📊 ملخص نتايج التنبيهات (آخر 24 ساعة، القياس بعد ساعة من التنبيه)"]
     for kind, name in KIND_NAMES.items():
@@ -676,6 +747,9 @@ def summary_text(st, now):
         g15 = [e["r15"] for e in g if "r15" in e]
         avg15 = f" | متوسط بعد 15 دقيقة {sum(g15) / len(g15):+.1f}%" if g15 else ""
         lines.append(f"{name}: {len(g)} تنبيه | {up} منهم أعلى بعد ساعة | متوسط بعد ساعة {avg60:+.1f}%{avg15}")
+    if dd:
+        upd = sum(1 for e in dd if e["r1440"] > 0)
+        lines.append(f"👀 فوليوم يومي: {len(dd)} تنبيه | {upd} منهم أعلى بعد يوم | متوسط بعد يوم {sum(e['r1440'] for e in dd) / len(dd):+.1f}%")
     lines.append("القياس لسعر التنبيه بس، مش ربح فعلي (من غير رسوم ولا انزلاق). ومش نصيحة مالية.")
     return "\n".join(lines)
 
@@ -821,6 +895,13 @@ def main():
     p.add_argument("--summary-hours", type=float, default=6.0, help="كل كام ساعة يبعتلك ملخص نتايج التنبيهات (0 = إيقاف)")
     p.add_argument("--no-vol", action="store_true", help="إيقاف فحص الفوليوم (يبقى تتبع الصعود بس، أسرع)")
     p.add_argument("--no-pump", action="store_true", help="إيقاف تتبع الصعود")
+    p.add_argument("--no-daily", action="store_true", help="إيقاف تنبيه الفوليوم اليومي (هدوء قبل العاصفة)")
+    p.add_argument("--daily-ratio", type=float, default=4.0, help="الفوليوم اليومي: أقل نسبة عن متوسط الأيام اللي فاتت")
+    p.add_argument("--daily-days", type=int, default=7, help="الفوليوم اليومي: عدد الأيام المقفولة اللي بنحسب متوسطها")
+    p.add_argument("--daily-move", type=float, default=5.0, help="الفوليوم اليومي: أقصى حركة سعر%% في 24 ساعة (هدوء)")
+    p.add_argument("--daily-week", type=float, default=25.0, help="الفوليوم اليومي: أقصى حركة سعر%% في الأسبوع (يمنع العملات اللي طالعة أصلاً)")
+    p.add_argument("--daily-min-usd", type=float, default=150_000, help="الفوليوم اليومي: أقل فوليوم 24س بالدولار")
+    p.add_argument("--daily-every", type=int, default=900, help="الفوليوم اليومي: كل كام ثانية يتفحص")
     p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
     a = p.parse_args()
     a.excl = {x.strip().upper() for x in a.exclude.split(",") if x.strip()}
@@ -880,6 +961,20 @@ def main():
                 seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"], "price": r["price"]}
             notify("\n\n".join(blocks))
             log_alerts(st, [(r["symbol"], "vol-hidden" if r["hidden"] else "vol-visible", r["price"]) for r in fresh[:10]], now)
+        if not a.no_vol and not a.no_daily and tickers and now - st.get("daily_t", 0) >= a.daily_every:
+            st["daily_t"] = now
+            dw = daily_watch(tickers, a, st, now)
+            print(f"فحص الفوليوم اليومي: {len(dw)} عملة")
+            if dw:
+                notify(
+                    "\n\n".join(format_daily(r) for r in dw[:8]),
+                    subject="Bitget scanner: فوليوم يومي غير عادي",
+                    title="Bitget daily watch",
+                    tags="eyes",
+                )
+                for r in dw[:8]:
+                    st["daily"][r["symbol"]] = now
+                log_alerts(st, [(r["symbol"], "daily", r["price"]) for r in dw[:8]], now)
         if not a.no_pump:
             pumps = track_pumps(tickers, a, st, now)
             print(f"تتبع الصعود: {len(pumps)} عملة صعدت {a.pump_pct:g}%+")
