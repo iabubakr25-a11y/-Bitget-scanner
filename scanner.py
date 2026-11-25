@@ -161,6 +161,8 @@ def analyze(item, a):
                 "vol24": vol24,
                 "chg24": chg24,
                 "hidden": hid,
+                # آخر شمعة 5 دقايق مقفولة أقفلت فوق إغلاق الشمعة اللي قبلها؟
+                "close_up": float(rows[-2][4]) > float(rows[-3][4]),
             }
     return best
 
@@ -251,6 +253,9 @@ def vol_direction(r, a):
 def enrich_vol(r, a):
     r = enrich(r, a)
     vol_direction(r, a)
+    # الفوليوم الأقل من close_up_below أضعاف لازم آخر شمعة 5 دقايق مقفولة تكون أقفلت فوق اللي قبلها
+    r["close_ok"] = a.close_up_below <= 0 or r["ratio"] >= a.close_up_below or r.get("close_up", True)
+    r["dir_ok"] = r["dir_ok"] and r["close_ok"]
     r["strong"] = r["strong"] and r["dir_ok"]
     # انفجار فوليوم (boom_ratio أضعاف أو أكتر): يتبعت حتى لو الأوردر بوك أو نسبة الشراء مش مؤكدين،
     # بس بشرط إن الفوليوم مش على شموع نزول (يعني مش تصريف)
@@ -921,6 +926,7 @@ def main():
     p.add_argument("--vol-step", type=float, default=1.5, help="يكرر التنبيه فوراً لو الفوليوم الحديث زاد بالمعامل ده عن آخر تنبيه")
     p.add_argument("--vol-price-step", type=float, default=3.0, help="يكرر تنبيه الفوليوم لو السعر كمل صعود كده%% فوق سعر آخر تنبيه (0 = إيقاف)")
     p.add_argument("--boom-ratio", type=float, default=3.0, help="انفجار الفوليوم: لو الفوليوم x كده أو أكتر يتبعت تنبيه بشكل مختلف حتى لو الأوردر بوك/نسبة الشراء مش مؤكدين (0 = إيقاف)")
+    p.add_argument("--close-up-below", type=float, default=10.0, help="أي تنبيه فوليوم أقل من x كده أضعاف لازم آخر شمعة 5 دقايق مقفولة تقفل فوق إغلاق الشمعة اللي قبلها (0 = إيقاف)")
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
     p.add_argument("--min-buy", type=float, default=60, help="أقل نسبة شراء عدواني %%")
     p.add_argument("--fills", type=int, default=300, help="عدد آخر الصفقات اللي بنحسب منها نسبة الشراء (حد أقصى 500)")
