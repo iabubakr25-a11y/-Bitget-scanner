@@ -85,6 +85,51 @@ def get_candidates(a, data=None):
     return out
 
 
+def ema_last(vals, n):
+    k = 2 / (n + 1)
+    e = vals[0]
+    for v in vals[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def rsi_last(vals, n=14):
+    if len(vals) < n + 1:
+        return 50.0
+    g = l = 0.0
+    for i in range(1, n + 1):
+        d = vals[i] - vals[i - 1]
+        g += max(d, 0)
+        l += max(-d, 0)
+    g, l = g / n, l / n
+    for i in range(n + 1, len(vals)):
+        d = vals[i] - vals[i - 1]
+        g = (g * (n - 1) + max(d, 0)) / n
+        l = (l * (n - 1) + max(-d, 0)) / n
+    return 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+
+
+def chart_read(rows):
+    """قراءة الشارت على شموع 5 دقايق المقفولة: ترند، كسر قمة، RSI، ومدى الابتعاد عن المتوسط."""
+    cl = rows[:-1]  # آخر شمعة لسه بتتكون، نشيلها
+    if len(cl) < 50:
+        return None
+    closes = [float(x[4]) for x in cl]
+    highs = [float(x[2]) for x in cl]
+    c = closes[-1]
+    e20, e48 = ema_last(closes, 20), ema_last(closes, 48)
+    ext = (c / e20 - 1) * 100 if e20 > 0 else 0.0
+    rsi = rsi_last(closes)
+    return {
+        "trend": c > e20 and e20 > e48,
+        "breakout": c > max(highs[-25:-1]),  # أعلى من أعلى قمة في آخر ساعتين
+        "rsi": rsi,
+        "rsi_ok": 50 <= rsi <= 78,
+        "ext": ext,
+        "ext_ok": ext <= 6.0,
+    }
+
+
 def tf_minutes(tf):
     t = tf.lower()
     if t.endswith("min"):
@@ -115,6 +160,7 @@ def analyze(item, a):
         a.floor,
     )
     best = None
+    chart = chart_read(rows)
     for k in a.wins:
         recent = rows[-k:]
         total = sum(float(r[6]) for r in recent)
@@ -138,6 +184,7 @@ def analyze(item, a):
             trend_ok
             and vis_ok
             and ratio >= getattr(a, "ratio_min", a.ratio)
+            and move >= getattr(a, "min_rise", 0)  # الفوليوم لازم يكون معاه صعود سعر فعلي في نفس الفترة
             and total >= a.min_usd
             and abs(move) <= a.max_move
             and rng <= a.max_range
@@ -163,6 +210,7 @@ def analyze(item, a):
                 "hidden": hid,
                 # آخر شمعة 5 دقايق مقفولة أقفلت فوق إغلاق الشمعة اللي قبلها؟
                 "close_up": float(rows[-2][4]) > float(rows[-3][4]),
+                "chart": chart,
             }
     return best
 
@@ -257,9 +305,19 @@ def enrich_vol(r, a):
     r["close_ok"] = a.close_up_below <= 0 or r["ratio"] >= a.close_up_below or r.get("close_up", True)
     r["dir_ok"] = r["dir_ok"] and r["close_ok"]
     r["strong"] = r["strong"] and r["dir_ok"]
+    # فلتر النخبة: دمج الفوليوم مع الشارت (ترند صاعد + كسر قمة أو فوليوم x6+ + RSI سليم + مش بعيد عن المتوسط) + تدفق شراء مؤكد
+    ch = r.get("chart")
+    r["elite"] = bool(
+        ch and r["strong"] and r["ratio"] >= a.ratio
+        and ch["trend"] and ch["rsi_ok"] and ch["ext_ok"]
+        and (ch["breakout"] or r["ratio"] >= 6)
+    )
+    # لو الفلتر شغال: أي تنبيه أقل من elite_bypass أضعاف لازم يكون نخبة، وغير كده بيتلغي
+    r["elite_ok"] = a.elite <= 0 or r["ratio"] >= a.elite_bypass or r["elite"]
+    r["strong"] = r["strong"] and r["elite_ok"]
     # انفجار فوليوم (boom_ratio أضعاف أو أكتر): يتبعت حتى لو الأوردر بوك أو نسبة الشراء مش مؤكدين،
     # بس بشرط إن الفوليوم مش على شموع نزول (يعني مش تصريف)
-    r["boom"] = a.boom_ratio > 0 and r["ratio"] >= a.boom_ratio and r["dir_ok"]
+    r["boom"] = a.boom_ratio > 0 and r["ratio"] >= a.boom_ratio and r["dir_ok"] and r["elite_ok"]
     # تنبيه الانفجار (شكل مختلف) بيتبعت بس للحالات اللي التنبيه العادي مكانش هيبعتها
     r["boomx"] = r["boom"] and not (r["strong"] and r["ratio"] >= a.ratio)
     return r
@@ -316,8 +374,18 @@ def pump_tier(r):
 
 
 def vol_tier(r):
-    """أهمية تنبيه الفوليوم: 2 = مهم جداً (x10+)، 1 = مهم (x6+)، 0 = عادي."""
+    """أهمية تنبيه الفوليوم: 2 = مهم جداً (x10+ أو نخبة)، 1 = مهم (x6+)، 0 = عادي."""
+    if r.get("elite"):
+        return 2
     return 2 if r["ratio"] >= 10 else (1 if r["ratio"] >= 6 else 0)
+
+
+def chart_line(r):
+    ch = r.get("chart")
+    if not ch:
+        return []
+    ok = lambda b: "✓" if b else "✗"
+    return [f"📈 الشارت (5د): ترند صاعد {ok(ch['trend'])} | كسر قمة ساعتين {ok(ch['breakout'])} | RSI {ch['rsi']:.0f} | بعد {ch['ext']:+.1f}% عن المتوسط"]
 
 
 BADGES = ["", "🔥 مهم  ", "🔥🔥 مهم جداً  "]
@@ -341,12 +409,13 @@ def format_alert(r, a):
         kind += " 🔁 فوليوم مكمل"
     return "\n".join(
         [
-            f"{BADGES[vol_tier(r)]}{tag}  {r['symbol']}  |  {kind}",
+            f"{'⭐ نخبة  ' if r.get('elite') else ''}{BADGES[vol_tier(r)]}{tag}  {r['symbol']}  |  {kind}",
             f"الفوليوم في آخر {r['mins']} دقيقة: ${r['recent_usd']:,.0f} (الطبيعي لنفس المدة ${r['baseline_per_candle'] * r['k']:,.0f}) x{r['ratio']:.1f}",
             f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}",
             f"آخر {r['trades']} صفقة" + (f" (بتغطي آخر {r['fills_min']:.0f} دقيقة)" if r.get("fills_min") is not None else "") + f": شراء ${r['buy_usd']:,.0f} مقابل بيع ${r['sell_usd']:,.0f}",
             *([f"اتجاه الفوليوم (شموع الدقيقة): {r['up_share']:.0f}% منه على شموع خضرا"] if r.get("up_share") is not None else []),
             *(["⚠️ عينة الصفقات أقصر من فترة الفوليوم، فنسبة الشراء مش للفترة كلها"] if r.get("fills_min") is not None and r["fills_min"] < r["mins"] * 0.5 else []),
+            *chart_line(r),
             reasons,
             f"https://www.bitget.com/spot/{r['symbol']}",
         ]
@@ -362,11 +431,12 @@ def format_boom(r):
         conf = f"❓ مش مؤكد: الشراء {r['buy_pct']:.0f}% | الأوردر بوك {r['book_pct']:.0f}% (الفوليوم هو السبب الوحيد)"
     return "\n".join(
         [
-            f"{'💥' * n} انفجار فوليوم x{r['ratio']:.1f}",
+            f"{'⭐ نخبة  ' if r.get('elite') else ''}{'💥' * n} انفجار فوليوم x{r['ratio']:.1f}",
             f"━━━ {r['symbol']} ━━━",
             f"الفوليوم: ${r['recent_usd']:,.0f} في آخر {r['mins']} دقيقة (الطبيعي ${r['baseline_per_candle'] * r['k']:,.0f})",
             f"السعر: {fmt_price(r['price'])} ({r['move']:+.1f}% في نفس الفترة)",
             conf,
+            *chart_line(r),
             "الفوليوم زاد وده بيحصل غالباً قبل أو أثناء حركة، مش ضمان لاتجاه. اتأكد من الشارت",
             f"https://www.bitget.com/spot/{r['symbol']}",
         ]
@@ -688,11 +758,16 @@ def debug_coin(sym, a, tickers, now):
                 if not a.no_trend and c < float(rows[-2][4]) * (1 - a.trend_tol / 100):
                     fails.append("السعر تحت إغلاق الشمعة اللي قبلها")
                 hid = abs(mv) <= a.h_move and (max(float(r[2]) for r in rec) / min(float(r[3]) for r in rec) - 1) * 100 <= a.h_range and abs(chg24) <= a.h_24
+                if getattr(a, "min_rise", 0) > 0 and mv < a.min_rise:
+                    fails.append(f"الصعود {mv:+.1f}% أقل من {a.min_rise:g}% (--min-rise)")
                 if not hid and mv < a.vis_min_move:
                     fails.append(f"مش مخفي (السعر مش هادي) والحركة {mv:+.1f}% أقل من {a.vis_min_move:g}%")
                 print(f"[DEBUG {sym}] [فوليوم] نافذة {k * a.tfm} دقيقة: x{ratio:.1f}، ${tot:,.0f}، حركة {mv:+.1f}% -> {'✅ عدّت' if not fails else '❌ ' + '، '.join(fails)}")
                 if not fails and ok_any is None:
                     ok_any = k
+            ch = chart_read(rows)
+            if ch:
+                print(f"[DEBUG {sym}] [الشارت 5د] ترند صاعد: {'✅' if ch['trend'] else '❌'} | كسر قمة ساعتين: {'✅' if ch['breakout'] else '❌'} | RSI {ch['rsi']:.0f} ({'✅' if ch['rsi_ok'] else '❌ خارج 50-78'}) | بعد {ch['ext']:+.1f}% عن المتوسط ({'✅' if ch['ext_ok'] else '❌ أكتر من 6%'})")
             if ok_any is not None:
                 r = enrich({"symbol": sym}, a)
                 bad = []
@@ -761,8 +836,10 @@ def log_alerts(st, items, now):
     del lg[:-300]
 
 
-def update_log(st, tickers, now):
-    """بيسجل سعر العملة بعد 15 و60 دقيقة (و6 ساعات ويوم) من التنبيه ويطبع النتيجة في اللوج."""
+def update_log(st, tickers, now, win=3.0, stop=2.0, horizon=120):
+    """بيتابع كل تنبيه: أعلى صعود وأعمق نزول بعد التنبيه، وبيحكم عليه أول ما يحصل واحد من:
+    نجح (طلع +win%% الأول) أو فشل (نزل -stop%% الأول) أو محايد (عدّى horizon دقيقة من غير الاتنين).
+    كمان بيسجل السعر بعد 15 و60 دقيقة (و6 ساعات ويوم) في اللوج."""
     lg = st.get("log", [])
     if not lg:
         return
@@ -776,10 +853,23 @@ def update_log(st, tickers, now):
         cur = px.get(e["s"])
         if not cur:
             continue
+        chg = (cur / e["p"] - 1) * 100
+        age = (now - e["t"]) / 60
+        if "res" not in e and e["k"] != "daily":
+            e["hi"] = max(e.get("hi", 0.0), chg)
+            e["lo"] = min(e.get("lo", 0.0), chg)
+            if chg >= win:
+                e["res"], e["res_m"] = "win", age
+            elif chg <= -stop:
+                e["res"], e["res_m"] = "loss", age
+            elif age >= horizon:
+                e["res"], e["res_m"] = "flat", age
+            if "res" in e:
+                print(f"حكم {e['s']} ({e['k']}): {e['res']} بعد {age:.0f} دقيقة | أعلى صعود {e['hi']:+.1f}% | أعمق نزول {e['lo']:+.1f}%")
         for m in (15, 60, 360, 1440):
             key = f"r{m}"
             if key not in e and now - e["t"] >= m * 60:
-                e[key] = (cur / e["p"] - 1) * 100
+                e[key] = chg
                 print(f"نتيجة {e['s']} ({e['k']}): بعد {m} دقيقة {e[key]:+.1f}% عن سعر التنبيه")
     st["log"] = [e for e in lg if now - e["t"] < 72 * 3600]
 
@@ -790,29 +880,40 @@ KIND_NAMES = {
     "vol-hidden": "🕶 فوليوم مخفي",
     "vol-visible": "📢 فوليوم ظاهر",
     "vol-boom": "💥 انفجار فوليوم",
+    "vol-elite": "⭐ نخبة (فوليوم + شارت)",
 }
 
 
-def summary_text(st, now):
-    """ملخص نتايج التنبيهات اللي عدّى عليها ساعة (آخر 24 ساعة)، لكل نوع تنبيه لوحده."""
-    done = [e for e in st.get("log", []) if "r60" in e and now - e["t"] < 24 * 3600 and e["k"] != "daily"]
-    dd = [e for e in st.get("log", []) if e["k"] == "daily" and "r1440" in e and now - e["t"] < 72 * 3600]
+def summary_text(st, now, win=3.0, stop=2.0, horizon=120):
+    """ملخص نتايج آخر 24 ساعة لكل نوع تنبيه: نجح (طلع +win%% قبل ما ينزل -stop%%) ولا فشل ولا محايد."""
+    lg = st.get("log", [])
+    done = [e for e in lg if "res" in e and now - e["t"] < 24 * 3600 and e["k"] != "daily"]
+    pend = [e for e in lg if "res" not in e and now - e["t"] < 24 * 3600 and e["k"] != "daily"]
+    dd = [e for e in lg if e["k"] == "daily" and "r1440" in e and now - e["t"] < 72 * 3600]
     if not done and not dd:
         return None
-    lines = ["📊 ملخص نتايج التنبيهات (آخر 24 ساعة، القياس بعد ساعة من التنبيه)"]
+    lines = [f"📊 ملخص نتايج التنبيهات (آخر 24 ساعة) | نجح = طلع +{win:g}% قبل ما ينزل -{stop:g}% | محايد = {horizon} دقيقة من غير الاتنين"]
+    tw = tl = 0
     for kind, name in KIND_NAMES.items():
         g = [e for e in done if e["k"] == kind]
         if not g:
             continue
-        up = sum(1 for e in g if e["r60"] > 0)
-        avg60 = sum(e["r60"] for e in g) / len(g)
-        g15 = [e["r15"] for e in g if "r15" in e]
-        avg15 = f" | متوسط بعد 15 دقيقة {sum(g15) / len(g15):+.1f}%" if g15 else ""
-        lines.append(f"{name}: {len(g)} تنبيه | {up} منهم أعلى بعد ساعة | متوسط بعد ساعة {avg60:+.1f}%{avg15}")
+        w = sum(1 for e in g if e["res"] == "win")
+        l = sum(1 for e in g if e["res"] == "loss")
+        f = len(g) - w - l
+        tw, tl = tw + w, tl + l
+        rate = f"{w / (w + l) * 100:.0f}%" if (w + l) else "-"
+        avg_hi = sum(e.get("hi", 0.0) for e in g) / len(g)
+        avg_lo = sum(e.get("lo", 0.0) for e in g) / len(g)
+        lines.append(f"{name}: {len(g)} تنبيه | نجح {w} | فشل {l} | محايد {f} | نسبة النجاح {rate} | متوسط أعلى صعود {avg_hi:+.1f}% | أعمق نزول {avg_lo:+.1f}%")
+    if tw + tl:
+        lines.append(f"الإجمالي: نسبة النجاح {tw / (tw + tl) * 100:.0f}% ({tw} نجح من {tw + tl} اتحسم)")
+    if pend:
+        lines.append(f"لسه بيتقاس: {len(pend)} تنبيه")
     if dd:
         upd = sum(1 for e in dd if e["r1440"] > 0)
         lines.append(f"👀 فوليوم يومي: {len(dd)} تنبيه | {upd} منهم أعلى بعد يوم | متوسط بعد يوم {sum(e['r1440'] for e in dd) / len(dd):+.1f}%")
-    lines.append("القياس لسعر التنبيه بس، مش ربح فعلي (من غير رسوم ولا انزلاق). ومش نصيحة مالية.")
+    lines.append("القياس بعينات كل نص دقيقة تقريباً (ممكن يفوت لمسة أسرع)، من غير رسوم ولا انزلاق. ومش نصيحة مالية.")
     return "\n".join(lines)
 
 
@@ -927,6 +1028,12 @@ def main():
     p.add_argument("--vol-price-step", type=float, default=3.0, help="يكرر تنبيه الفوليوم لو السعر كمل صعود كده%% فوق سعر آخر تنبيه (0 = إيقاف)")
     p.add_argument("--boom-ratio", type=float, default=3.0, help="انفجار الفوليوم: لو الفوليوم x كده أو أكتر يتبعت تنبيه بشكل مختلف حتى لو الأوردر بوك/نسبة الشراء مش مؤكدين (0 = إيقاف)")
     p.add_argument("--close-up-below", type=float, default=10.0, help="أي تنبيه فوليوم أقل من x كده أضعاف لازم آخر شمعة 5 دقايق مقفولة تقفل فوق إغلاق الشمعة اللي قبلها (0 = إيقاف)")
+    p.add_argument("--elite", type=int, default=1, help="فلتر النخبة (فوليوم + شارت): 1 = أي تنبيه فوليوم أقل من --elite-bypass أضعاف لازم يعدي فحص الشارت، 0 = إيقاف")
+    p.add_argument("--elite-bypass", type=float, default=10.0, help="الفوليوم من x كده أو أكتر بيعدي من غير فحص الشارت (عشان الفرص الكبيرة ما تفوتش)")
+    p.add_argument("--win-pct", type=float, default=3.0, help="قياس النتايج: التنبيه ينجح لو السعر طلع كده%% فوق سعر التنبيه في أي لحظة (قبل ما ينزل stop-pct)")
+    p.add_argument("--stop-pct", type=float, default=2.0, help="قياس النتايج: التنبيه يفشل لو السعر نزل كده%% تحت سعر التنبيه الأول")
+    p.add_argument("--eval-min", type=int, default=120, help="قياس النتايج: بعد كام دقيقة من غير نجاح ولا فشل يتحسب محايد")
+    p.add_argument("--min-rise", type=float, default=5.0, help="تنبيه الفوليوم لازم يكون معاه صعود سعر كده%% على الأقل في نفس الفترة (0 = إيقاف، يرجّع التنبيهات المخفية: فوليوم من غير حركة سعر)")
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
     p.add_argument("--min-buy", type=float, default=60, help="أقل نسبة شراء عدواني %%")
     p.add_argument("--fills", type=int, default=300, help="عدد آخر الصفقات اللي بنحسب منها نسبة الشراء (حد أقصى 500)")
@@ -1002,7 +1109,7 @@ def main():
         if not a.no_vol:
             print_table(results, a)
         now = time.time()
-        update_log(st, tickers, now)
+        update_log(st, tickers, now, a.win_pct, a.stop_pct, a.eval_min)
         for ds in dbg_syms:
             try:
                 debug_coin(ds, a, tickers, now)
@@ -1035,7 +1142,7 @@ def main():
                 tags="rotating_light,boom" if tb == 2 else "boom",
                 priority="urgent" if tb == 2 else "high",
             )
-            log_alerts(st, [(r["symbol"], "vol-boom", r["price"]) for r in sb], now)
+            log_alerts(st, [(r["symbol"], "vol-elite" if r.get("elite") else "vol-boom", r["price"]) for r in sb], now)
         if fresh:
             blocks = []
             for r in fresh[:10]:
@@ -1050,7 +1157,7 @@ def main():
                 tags=["mag", "fire", "rotating_light,fire"][tv],
                 priority="urgent" if tv == 2 else "high",
             )
-            log_alerts(st, [(r["symbol"], "vol-hidden" if r["hidden"] else "vol-visible", r["price"]) for r in fresh[:10]], now)
+            log_alerts(st, [(r["symbol"], "vol-elite" if r.get("elite") else ("vol-hidden" if r["hidden"] else "vol-visible"), r["price"]) for r in fresh[:10]], now)
         if not a.no_vol and not a.no_daily and tickers and now - st.get("daily_t", 0) >= a.daily_every:
             st["daily_t"] = now
             dw = daily_watch(tickers, a, st, now)
@@ -1097,7 +1204,7 @@ def main():
             if "sum_t" not in st:
                 st["sum_t"] = now
             elif now - st["sum_t"] >= a.summary_hours * 3600:
-                txt = summary_text(st, now)
+                txt = summary_text(st, now, a.win_pct, a.stop_pct, a.eval_min)
                 if txt:
                     notify(txt, subject="Bitget scanner: ملخص النتايج", title="Bitget summary", tags="bar_chart")
                 st["sum_t"] = now
