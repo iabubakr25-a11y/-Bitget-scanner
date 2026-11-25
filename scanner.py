@@ -122,7 +122,7 @@ def analyze(item, a):
         if (
             trend_ok
             and vis_ok
-            and ratio >= a.ratio
+            and ratio >= getattr(a, "ratio_min", a.ratio)
             and total >= a.min_usd
             and abs(move) <= a.max_move
             and rng <= a.max_range
@@ -237,6 +237,11 @@ def enrich_vol(r, a):
     r = enrich(r, a)
     vol_direction(r, a)
     r["strong"] = r["strong"] and r["dir_ok"]
+    # انفجار فوليوم (boom_ratio أضعاف أو أكتر): يتبعت حتى لو الأوردر بوك أو نسبة الشراء مش مؤكدين،
+    # بس بشرط إن الفوليوم مش على شموع نزول (يعني مش تصريف)
+    r["boom"] = a.boom_ratio > 0 and r["ratio"] >= a.boom_ratio and r["dir_ok"]
+    # تنبيه الانفجار (شكل مختلف) بيتبعت بس للحالات اللي التنبيه العادي مكانش هيبعتها
+    r["boomx"] = r["boom"] and not (r["strong"] and r["ratio"] >= a.ratio)
     return r
 
 
@@ -252,8 +257,8 @@ def scan(a, tickers=None):
         with ThreadPoolExecutor(max_workers=a.workers) as ex:
             results = list(ex.map(lambda r: enrich_vol(r, a), results))
     if not a.weak:
-        results = [r for r in results if r["strong"]]
-    results.sort(key=lambda r: (r["strong"], r["ratio"]), reverse=True)
+        results = [r for r in results if (r["strong"] and r["ratio"] >= a.ratio) or r.get("boom")]
+    results.sort(key=lambda r: (r["strong"] or bool(r.get("boom")), r["ratio"]), reverse=True)
     return results
 
 
@@ -285,6 +290,19 @@ def fmt_price(p):
     return s.rstrip("0").rstrip(".")
 
 
+def pump_tier(r):
+    """أهمية تنبيه الصعود: 2 = مهم جداً (صعود 25%+)، 1 = مهم (12%+)، 0 = عادي."""
+    return 2 if r["rise"] >= 25 else (1 if r["rise"] >= 12 else 0)
+
+
+def vol_tier(r):
+    """أهمية تنبيه الفوليوم: 2 = مهم جداً (x10+)، 1 = مهم (x6+)، 0 = عادي."""
+    return 2 if r["ratio"] >= 10 else (1 if r["ratio"] >= 6 else 0)
+
+
+BADGES = ["", "🔥 مهم  ", "🔥🔥 مهم جداً  "]
+
+
 def format_alert(r, a):
     """شكل التنبيه: الحكم + الأرقام + الأسباب + لينك Bitget."""
     if r["strong"]:
@@ -293,7 +311,7 @@ def format_alert(r, a):
         tag = "🤖 شبهة بوت"
     else:
         tag = "⚠️ ضعيف"
-    reasons = f"إيجابي: الشراء غالب {r['buy_pct']:.0f}%"
+    reasons = f"إيجابي: الشراء غالب {r['buy_pct']:.0f}%" if r["buy_pct"] >= 50 else f"نسبة الشراء {r['buy_pct']:.0f}% بس"
     if not r["botlike"]:
         reasons += f"، أحجام الصفقات متنوعة ({r['trades']} صفقة)"
     reasons += f"، طلبات شراء تحت السعر (${r['bid_usd']:,.0f})"
@@ -303,13 +321,33 @@ def format_alert(r, a):
         kind += " 🔁 فوليوم مكمل"
     return "\n".join(
         [
-            f"{tag}  {r['symbol']}  |  {kind}",
+            f"{BADGES[vol_tier(r)]}{tag}  {r['symbol']}  |  {kind}",
             f"الفوليوم في آخر {r['mins']} دقيقة: ${r['recent_usd']:,.0f} (الطبيعي لنفس المدة ${r['baseline_per_candle'] * r['k']:,.0f}) x{r['ratio']:.1f}",
             f"حركة السعر: {r['move']:+.1f}%  |  السعر: {fmt_price(r['price'])}",
             f"آخر {r['trades']} صفقة" + (f" (بتغطي آخر {r['fills_min']:.0f} دقيقة)" if r.get("fills_min") is not None else "") + f": شراء ${r['buy_usd']:,.0f} مقابل بيع ${r['sell_usd']:,.0f}",
             *([f"اتجاه الفوليوم (شموع الدقيقة): {r['up_share']:.0f}% منه على شموع خضرا"] if r.get("up_share") is not None else []),
             *(["⚠️ عينة الصفقات أقصر من فترة الفوليوم، فنسبة الشراء مش للفترة كلها"] if r.get("fills_min") is not None and r["fills_min"] < r["mins"] * 0.5 else []),
             reasons,
+            f"https://www.bitget.com/spot/{r['symbol']}",
+        ]
+    )
+
+
+def format_boom(r):
+    """تنبيه انفجار الفوليوم: شكل مختلف تماماً عن باقي التنبيهات عشان يبان بسرعة."""
+    n = 3 if r["ratio"] >= 10 else (2 if r["ratio"] >= 6 else 1)
+    if r["strong"]:
+        conf = f"✅ مؤكد: الشراء {r['buy_pct']:.0f}% | الأوردر بوك {r['book_pct']:.0f}%"
+    else:
+        conf = f"❓ مش مؤكد: الشراء {r['buy_pct']:.0f}% | الأوردر بوك {r['book_pct']:.0f}% (الفوليوم هو السبب الوحيد)"
+    return "\n".join(
+        [
+            f"{'💥' * n} انفجار فوليوم x{r['ratio']:.1f}",
+            f"━━━ {r['symbol']} ━━━",
+            f"الفوليوم: ${r['recent_usd']:,.0f} في آخر {r['mins']} دقيقة (الطبيعي ${r['baseline_per_candle'] * r['k']:,.0f})",
+            f"السعر: {fmt_price(r['price'])} ({r['move']:+.1f}% في نفس الفترة)",
+            conf,
+            "الفوليوم زاد وده بيحصل غالباً قبل أو أثناء حركة، مش ضمان لاتجاه. اتأكد من الشارت",
             f"https://www.bitget.com/spot/{r['symbol']}",
         ]
     )
@@ -493,7 +531,7 @@ def format_pump(r):
     else:
         head = "🚀 صعود جديد"
     lines = [
-        f"{head}  {r['symbol']}",
+        f"{BADGES[pump_tier(r)]}{head}  {r['symbol']}",
         f"صعدت {r['rise']:.1f}% في آخر {r['mins']:.0f} دقيقة  |  إغلاق الشمعة: {fmt_price(r['price'])}",
         f"السعر دلوقتي: {fmt_price(r['now_price'])} ({(r['now_price'] / r['price'] - 1) * 100:+.1f}% عن الإغلاق)",
         f"✅ {r['why']}",
@@ -507,7 +545,10 @@ def format_pump(r):
             flow += "  |  🤖 شبهة بوت"
         lines.append(flow)
         if r["book_pct"] < 40:
-            lines.append("⚠️ طلبات البيع أكتر من الشراء، احتمال تصريف")
+            if r["bid_usd"] <= 0:
+                lines.append("⚠️ مفيش طلبات شراء قريبة من السعر (حركة سريعة أو سوق رفيع)، مش بالضرورة تصريف")
+            else:
+                lines.append("⚠️ طلبات البيع أكتر من الشراء، احتمال تصريف")
     lines.append("⚠️ الصعود حصل بالفعل، اتأكد من الشارت قبل أي قرار")
     lines.append(f"https://www.bitget.com/spot/{r['symbol']}")
     return "\n".join(lines)
@@ -728,6 +769,7 @@ KIND_NAMES = {
     "rebound": "🔄 ارتداد",
     "vol-hidden": "🕶 فوليوم مخفي",
     "vol-visible": "📢 فوليوم ظاهر",
+    "vol-boom": "💥 انفجار فوليوم",
 }
 
 
@@ -787,7 +829,7 @@ def send_email(body, subject="Bitget scanner: عملات حجمها قفز"):
         print("email failed:", e)
 
 
-def send_ntfy(body, title="Bitget scanner", tags="mag"):
+def send_ntfy(body, title="Bitget scanner", tags="mag", priority="high"):
     topic = os.getenv("NTFY_TOPIC")
     if not topic:
         print("ntfy: NTFY_TOPIC مش متضبط")
@@ -798,7 +840,7 @@ def send_ntfy(body, title="Bitget scanner", tags="mag"):
             r = requests.post(
                 f"https://ntfy.sh/{topic}",
                 data=data,
-                headers={"Title": title, "Priority": "high", "Tags": tags},
+                headers={"Title": title, "Priority": priority, "Tags": tags},
                 timeout=15,
             )
             if r.status_code == 200:
@@ -813,10 +855,10 @@ def send_ntfy(body, title="Bitget scanner", tags="mag"):
             time.sleep(2)
 
 
-def notify(body, subject="Bitget scanner: عملات حجمها قفز", title="Bitget scanner", tags="mag"):
+def notify(body, subject="Bitget scanner: عملات حجمها قفز", title="Bitget scanner", tags="mag", priority="high"):
     telegram(body)
     send_email(body, subject)
-    send_ntfy(body, title, tags)
+    send_ntfy(body, title, tags, priority)
 
 
 def load_state(path):
@@ -863,6 +905,7 @@ def main():
     p.add_argument("--cooldown", type=int, default=900, help="ثواني قبل تكرار تنبيه نفس العملة لو الفوليوم لسه عالي")
     p.add_argument("--vol-step", type=float, default=1.5, help="يكرر التنبيه فوراً لو الفوليوم الحديث زاد بالمعامل ده عن آخر تنبيه")
     p.add_argument("--vol-price-step", type=float, default=3.0, help="يكرر تنبيه الفوليوم لو السعر كمل صعود كده%% فوق سعر آخر تنبيه (0 = إيقاف)")
+    p.add_argument("--boom-ratio", type=float, default=3.0, help="انفجار الفوليوم: لو الفوليوم x كده أو أكتر يتبعت تنبيه بشكل مختلف حتى لو الأوردر بوك/نسبة الشراء مش مؤكدين (0 = إيقاف)")
     p.add_argument("--hidden-only", action="store_true", help="الرجوع للوضع القديم: العملات الهادية سعرياً بس")
     p.add_argument("--min-buy", type=float, default=60, help="أقل نسبة شراء عدواني %%")
     p.add_argument("--fills", type=int, default=300, help="عدد آخر الصفقات اللي بنحسب منها نسبة الشراء (حد أقصى 500)")
@@ -907,6 +950,7 @@ def main():
     a.excl = {x.strip().upper() for x in a.exclude.split(",") if x.strip()}
     dbg_syms = [x.strip().upper() for x in a.debug.split(",") if x.strip()]
     a.tfm = tf_minutes(a.tf)
+    a.ratio_min = min(a.ratio, a.boom_ratio) if a.boom_ratio > 0 else a.ratio
     a.ptfm = tf_minutes(a.pump_tf)
     a.wins = sorted({int(x) for x in a.windows.split(",") if x.strip()})
     # حدود "المخفي" بتتحفظ للتصنيف، وبعدين الفلاتر بتتفتح عشان العملات الظاهرة تتراقب كمان
@@ -954,12 +998,35 @@ def main():
             ):
                 r["repeat"] = True
                 fresh.append(r)
+        booms = [r for r in fresh if r.get("boomx")]
+        fresh = [r for r in fresh if not r.get("boomx")]
+        if booms:
+            sb = sorted(booms, key=lambda r: r["ratio"], reverse=True)[:8]
+            for r in sb:
+                seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"], "price": r["price"]}
+            tb = max(vol_tier(r) for r in sb)
+            notify(
+                "\n\n".join(format_boom(r) for r in sb),
+                subject="Bitget scanner: انفجار فوليوم",
+                title=f"BOOM {sb[0]['symbol']} x{sb[0]['ratio']:.0f} volume" + (f" (+{len(sb) - 1})" if len(sb) > 1 else ""),
+                tags="rotating_light,boom" if tb == 2 else "boom",
+                priority="urgent" if tb == 2 else "high",
+            )
+            log_alerts(st, [(r["symbol"], "vol-boom", r["price"]) for r in sb], now)
         if fresh:
             blocks = []
             for r in fresh[:10]:
                 blocks.append(format_alert(r, a))
                 seen[r["symbol"]] = {"ts": now, "vol": r["vol_rate"], "price": r["price"]}
-            notify("\n\n".join(blocks))
+            shown = fresh[:10]
+            tv = max(vol_tier(r) for r in shown)
+            topv = max(shown, key=lambda r: r["ratio"])
+            notify(
+                "\n\n".join(blocks),
+                title=f"{topv['symbol']} x{topv['ratio']:.0f} volume" + (f" (+{len(shown) - 1})" if len(shown) > 1 else ""),
+                tags=["mag", "fire", "rotating_light,fire"][tv],
+                priority="urgent" if tv == 2 else "high",
+            )
             log_alerts(st, [(r["symbol"], "vol-hidden" if r["hidden"] else "vol-visible", r["price"]) for r in fresh[:10]], now)
         if not a.no_vol and not a.no_daily and tickers and now - st.get("daily_t", 0) >= a.daily_every:
             st["daily_t"] = now
@@ -992,11 +1059,15 @@ def main():
                     print("تجاهل (البيع غالب):", ", ".join(weak_buy))
                 pumps = [r for r in pumps if not r["trades"] or r["buy_pct"] >= a.pump_min_buy]
             if pumps:
+                sp = pumps[:8]
+                tp = max(pump_tier(r) for r in sp)
+                topp = max(sp, key=lambda r: r["rise"])
                 notify(
-                    "\n\n".join(format_pump(r) for r in pumps[:8]),
+                    "\n\n".join(format_pump(r) for r in sp),
                     subject="Bitget scanner: عملات صعدت",
-                    title="Bitget pump",
-                    tags="rocket",
+                    title=f"{topp['symbol']} +{topp['rise']:.0f}% pump" + (f" (+{len(sp) - 1})" if len(sp) > 1 else ""),
+                    tags=["rocket", "fire", "rotating_light,fire"][tp],
+                    priority="urgent" if tp == 2 else "high",
                 )
                 log_alerts(st, [(r["symbol"], "rebound" if r["why"].startswith("ارتداد") else "pump", r["now_price"]) for r in pumps[:8]], now)
         if a.summary_hours > 0:
