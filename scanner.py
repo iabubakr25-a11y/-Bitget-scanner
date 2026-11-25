@@ -31,6 +31,21 @@ BASE = "https://api.bitget.com"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "stealth-scanner/1.0"})
 
+REAL_R = {"RAY","RUNE","RSR","RVN","RPL","RLC","ROSE","RENDER","REZ","REQ","REEF","RARE","RAD","RDNT","RIF","RLUSD","RON","RNDR","RSC","RATS","RACA","RAYDIUM","REN","REI","RBN","RLY","RPK","RFR","RIO","ROOT","RPG","RYO"}
+
+
+class ExclSet(set):
+    """مستبعدات يدوية + أسهم مرمّزة: أي رمز بيبدأ بـ R (عدا عملات R الحقيقية) بيتعامل كسهم مرمّز."""
+    block_r = True
+
+    def __contains__(self, sym):
+        if set.__contains__(self, sym):
+            return True
+        if self.block_r and sym.endswith("USDT"):
+            b = sym[:-4]
+            return len(b) >= 3 and b[0] == "R" and b not in REAL_R
+        return False
+
 
 def api_get(path, params=None, retries=3):
     for i in range(retries):
@@ -934,6 +949,7 @@ def main():
     p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
     p.add_argument("--exclude", default="RBRAIUSDT,RKLMNUSDT,RDISUSDT,RSONYUSDT,RKOUSDT,RMCDUSDT,RPYPLUSDT,RNASAUSDT,RBMNRUSDT,RROKUUSDT,RLCIDUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
+    p.add_argument("--allow-r", action="store_true", help="إيقاف حجب الرموز اللي بتبدأ بـ R (أسهم مرمّزة)")
     p.add_argument("--debug", default="", help="عملات للتشخيص (مفصولة بفاصلة): يطبع في اللوج ليه اتبعتت أو اتلغت. ممكن كمان تتكتب في ملف debug.txt")
     p.add_argument("--summary-hours", type=float, default=6.0, help="كل كام ساعة يبعتلك ملخص نتايج التنبيهات (0 = إيقاف)")
     p.add_argument("--no-vol", action="store_true", help="إيقاف فحص الفوليوم (يبقى تتبع الصعود بس، أسرع)")
@@ -947,7 +963,8 @@ def main():
     p.add_argument("--daily-every", type=int, default=900, help="الفوليوم اليومي: كل كام ثانية يتفحص")
     p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
     a = p.parse_args()
-    a.excl = {x.strip().upper() for x in a.exclude.split(",") if x.strip()}
+    a.excl = ExclSet(x.strip().upper() for x in a.exclude.split(",") if x.strip())
+    a.excl.block_r = not a.allow_r
     dbg_syms = [x.strip().upper() for x in a.debug.split(",") if x.strip()]
     a.tfm = tf_minutes(a.tf)
     a.ratio_min = min(a.ratio, a.boom_ratio) if a.boom_ratio > 0 else a.ratio
