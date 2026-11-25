@@ -53,7 +53,7 @@ jobs:
       - name: Run volume scanner
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state-vol.json --no-pump --loop 30 --duration 3000 --workers 12 --ratio 5 --min-usd 2000 --cooldown 1800 --vol-step 2
+        run: python scanner.py --state state-vol.json --no-pump --loop 30 --duration 3000 --workers 12 --windows 1 --ratio 40 --boom-ratio 40 --min-usd 2000 --cooldown 1800 --vol-step 2
       - name: save state
         uses: actions/cache/save@v4
         if: always()
