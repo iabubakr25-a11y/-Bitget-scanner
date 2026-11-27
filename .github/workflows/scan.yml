@@ -79,10 +79,36 @@ jobs:
       - name: Run 1-minute volume scanner
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python scanner.py --state state-vol1m.json --no-pump --no-daily --loop 20 --duration 3000 --workers 12 --tf 1min --tag 1m-PUMP --windows 1,3,5 --ratio 10 --boom-ratio 10 --min-usd 1500 --min-rise 0 --vis-min-move 0 --min-active 2 --cooldown 1800 --vol-step 2
+        run: python scanner.py --state state-vol1m.json --no-pump --no-daily --loop 20 --duration 3000 --workers 12 --tf 1min --tag 1m-PUMP --windows 1,3,5 --ratio 10 --boom-ratio 10 --min-usd 1500 --min-rise 3 --vis-min-move 3 --min-active 2 --cooldown 1800 --vol-step 2
       - name: save state
         uses: actions/cache/save@v4
         if: always()
         with:
           path: state-vol1m.json
           key: scanner-vol1m-${{ github.run_id }}
+
+  early:
+    runs-on: ubuntu-latest
+    timeout-minutes: 62
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state-early.json
+          key: scanner-early-${{ github.run_id }}
+          restore-keys: scanner-early-
+      - name: Run early volume scanner
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python scanner.py --state state-early.json --no-pump --no-daily --loop 15 --duration 3000 --workers 12 --tf 1min --tag EARLY --hidden-only --windows 1,2,3 --ratio 10 --boom-ratio 10 --min-usd 1000 --min-rise 0 --vis-min-move 0 --min-active 1 --max-move 3 --max-range 8 --cooldown 900 --vol-step 2
+      - name: save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state-early.json
+          key: scanner-early-${{ github.run_id }}
