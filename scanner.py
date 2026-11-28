@@ -31,6 +31,7 @@ BASE = "https://api.bitget.com"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "stealth-scanner/1.0"})
 
+
 REAL_R = {"RAY","RUNE","RSR","RVN","RPL","RLC","ROSE","RENDER","REZ","REQ","REEF","RARE","RAD","RDNT","RIF","RLUSD","RON","RNDR","RSC","RATS","RACA","RAYDIUM","REN","REI","RBN","RLY","RPK","RFR","RIO","ROOT","RPG","RYO"}
 
 
@@ -338,7 +339,7 @@ def scan(a, tickers=None):
         results = [r for r in results if (r["strong"] and r["ratio"] >= a.ratio) or r.get("boom")]
     results.sort(key=lambda r: (r["strong"] or bool(r.get("boom")), r["ratio"]), reverse=True)
     return results
-
+    
 
 def print_table(results, a):
     if not results:
@@ -765,9 +766,6 @@ def debug_coin(sym, a, tickers, now):
                 print(f"[DEBUG {sym}] [فوليوم] نافذة {k * a.tfm} دقيقة: x{ratio:.1f}، ${tot:,.0f}، حركة {mv:+.1f}% -> {'✅ عدّت' if not fails else '❌ ' + '، '.join(fails)}")
                 if not fails and ok_any is None:
                     ok_any = k
-            ch = chart_read(rows)
-            if ch:
-                print(f"[DEBUG {sym}] [الشارت 5د] ترند صاعد: {'✅' if ch['trend'] else '❌'} | كسر قمة ساعتين: {'✅' if ch['breakout'] else '❌'} | RSI {ch['rsi']:.0f} ({'✅' if ch['rsi_ok'] else '❌ خارج 50-78'}) | بعد {ch['ext']:+.1f}% عن المتوسط ({'✅' if ch['ext_ok'] else '❌ أكتر من 6%'})")
             if ok_any is not None:
                 r = enrich({"symbol": sym}, a)
                 bad = []
@@ -825,7 +823,7 @@ def debug_coin(sym, a, tickers, now):
                 print(f"[DEBUG {sym}] ❌ [صعود] السعر الحالي {fmt_price(price)} نزل تحت إغلاق الشمعة {fmt_price(res['price'])} بأكتر من {a.hold_pct:g}% (انعكاس)")
             else:
                 print(f"[DEBUG {sym}] ✅ [صعود] المفروض يتبعت بعد {a.confirm_sec} ثانية تأكيد")
-
+                
 
 def log_alerts(st, items, now):
     """بنسجل كل تنبيه (العملة، النوع، السعر) عشان نقيس بعدها بربع ساعة وساعة نتيجته فعلاً."""
@@ -1062,6 +1060,7 @@ def main():
     p.add_argument("--pump-gap", type=int, default=120, help="أقل ثواني بين تنبيهين لنفس العملة في تتبع الصعود")
     p.add_argument("--pump-min-vol24", type=float, default=20_000, help="أقل فوليوم 24س للعملة في تتبع الصعود $")
     p.add_argument("--exclude", default="RBRAIUSDT,RKLMNUSDT,RDISUSDT,RSONYUSDT,RKOUSDT,RMCDUSDT,RPYPLUSDT,RNASAUSDT,RBMNRUSDT,RROKUUSDT,RLCIDUSDT", help="عملات مستبعدة (أسهم مرمّزة مثلاً)، مفصولة بفاصلة")
+    p.add_argument("--tag", default="", help="كلمة تتحط في أول عنوان تنبيهات الفوليوم عشان تفرّق بينها (مثلاً 1m-PUMP)، حروف إنجليزي بس")
     p.add_argument("--allow-r", action="store_true", help="إيقاف حجب الرموز اللي بتبدأ بـ R (أسهم مرمّزة)")
     p.add_argument("--debug", default="", help="عملات للتشخيص (مفصولة بفاصلة): يطبع في اللوج ليه اتبعتت أو اتلغت. ممكن كمان تتكتب في ملف debug.txt")
     p.add_argument("--summary-hours", type=float, default=6.0, help="كل كام ساعة يبعتلك ملخص نتايج التنبيهات (0 = إيقاف)")
@@ -1076,6 +1075,7 @@ def main():
     p.add_argument("--daily-every", type=int, default=900, help="الفوليوم اليومي: كل كام ثانية يتفحص")
     p.add_argument("--state", default=None, help="ملف لحفظ التنبيهات اللي اتبعتت (لمنع التكرار)")
     a = p.parse_args()
+    a.tag = (a.tag.strip() + " ") if a.tag.strip() else ""
     a.excl = ExclSet(x.strip().upper() for x in a.exclude.split(",") if x.strip())
     a.excl.block_r = not a.allow_r
     dbg_syms = [x.strip().upper() for x in a.debug.split(",") if x.strip()]
@@ -1138,7 +1138,7 @@ def main():
             notify(
                 "\n\n".join(format_boom(r) for r in sb),
                 subject="Bitget scanner: انفجار فوليوم",
-                title=f"BOOM {sb[0]['symbol']} x{sb[0]['ratio']:.0f} volume" + (f" (+{len(sb) - 1})" if len(sb) > 1 else ""),
+                title=f"{a.tag}BOOM {sb[0]['symbol']} x{sb[0]['ratio']:.0f} volume" + (f" (+{len(sb) - 1})" if len(sb) > 1 else ""),
                 tags="rotating_light,boom" if tb == 2 else "boom",
                 priority="urgent" if tb == 2 else "high",
             )
@@ -1153,7 +1153,7 @@ def main():
             topv = max(shown, key=lambda r: r["ratio"])
             notify(
                 "\n\n".join(blocks),
-                title=f"{topv['symbol']} x{topv['ratio']:.0f} volume" + (f" (+{len(shown) - 1})" if len(shown) > 1 else ""),
+                title=f"{a.tag}{topv['symbol']} x{topv['ratio']:.0f} volume" + (f" (+{len(shown) - 1})" if len(shown) > 1 else ""),
                 tags=["mag", "fire", "rotating_light,fire"][tv],
                 priority="urgent" if tv == 2 else "high",
             )
